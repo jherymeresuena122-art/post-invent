@@ -11,6 +11,7 @@ from datetime import date, datetime
 from kivy.app import App
 from kivy.clock import Clock
 from kivy.core.window import Window
+from kivy.lang import Builder
 from kivy.metrics import dp
 from kivy.properties import (
     BooleanProperty,
@@ -952,8 +953,21 @@ class PodInventoryApp(App):
     next_duty_text = StringProperty("")
     target_date = StringProperty("")
 
+    def _ensure_kv(self):
+        """Make sure the look file is loaded (on Android it can be missed)."""
+        here = os.path.dirname(os.path.abspath(__file__))
+        path = os.path.join(here, "podinventory.kv")
+        if any(str(f).endswith("podinventory.kv") for f in Builder.files):
+            return
+        if not os.path.exists(path):
+            raise FileNotFoundError(
+                f"podinventory.kv not found in {here}. Files here: {sorted(os.listdir(here))}"
+            )
+        Builder.load_file(path)
+
     def build(self):
         self.title = "The Pod Inventory"
+        self._ensure_kv()
         self.db = Database(os.path.join(self.user_data_dir, "pod_inventory.db"))
         manager = ScreenManager(transition=SlideTransition(duration=0.18))
         manager.add_widget(ChooseUserScreen(name="choose"))
