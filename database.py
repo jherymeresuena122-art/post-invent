@@ -1,0 +1,495 @@
+"""Local SQLite storage for The Pod inventory app.
+
+Everything the app remembers lives in one small database file on the phone.
+A submitted day is locked: only the Creator admin can unlock it for editing,
+and every such edit is written to the day's history.
+"""
+import hashlib
+import hmac
+import os
+import sqlite3
+from contextlib import closing
+from datetime import datetime
+
+from permissions import ADMIN, normalize_role
+
+
+class EventLockedError(Exception):
+    """Raised when someone tries to change a day that was already submitted."""
+
+
+def _now():
+    return datetime.now().isoformat(timespec="seconds")
+
+
+def _hash_pin(pin, salt_hex):
+    return hashlib.pbkdf2_hmac(
+        "sha256", pin.encode("utf-8"), bytes.fromhex(salt_hex), 100_000
+    ).hex()
+
+
+def _show(value):
+    if value is None:
+        return "-"
+    if isinstance(value, float):
+        return f"{round(value, 3):g}"
+    return str(value)
+
+
+def _describe_changes(old, new):
+    """Short plain-text list of what an admin changed on a submitted day."""
+    notes = []
+    if old["location"] != new["location"]:
+        notes.append(f"location: {old['location']} -> {new['location']}")
+    old_items = {i["name"]: i for i in old["items"]}
+    new_items = {i["name"]: i for i in new["items"]}
+    for name, item in new_items.items():
+        before = old_items.get(name)
+        if before is None:
+            notes.append(f"added {name}")
+            continue
+        for key in ("before", "after", "unit"):
+            if before[key] != item[key]:
+                notes.append(f"{name} {key}: {_show(before[key])} -> {_show(item[key])}")
+    for name in old_items:
+        if name not in new_items:
+            notes.append(f"removed {name}")
+    if old["team"] != new["team"]:
+        notes.append("team changed")
+    if old["crew"] != new["crew"]:
+        notes.append("crew names changed")
+    return "; ".join(notes) or "no changes"
+
+
+class Database:
+    def __init__(self, path):
+        self.path = path
+        self._create_tables()
+
+    # ------------------------------------------------------------------ setup
+    def _connect(self):
+        conn = sqlite3.connect(self.path)
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA foreign_keys = ON")
+        return conn
+
+    def _create_tables(self):
+        with closing(self._connect()) as conn, conn:
+            conn.executescript(
+                """
+                CREATE TABLE IF NOT EXISTS users (
+                    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                    name        TEXT NOT NULL,
+                    role        TEXT NOT NULL DEFAULT 'crew',
+                    photo_path  TEXT,
+                    created_at  TEXT NOT NULL,
+                    pin_hash    TEXT,
+                    pin_salt    TEXT
+                );
+
+                CREATE TABLE IF NOT EXISTS events (
+                    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+                    event_date    TEXT NOT NULL UNIQUE,   -- YYYY-MM-DD
+                    location      TEXT NOT NULL,
+                    created_by    INTEGER REFERENCES users(id),
+                    created_at    TEXT NOT NULL,
+                    submitted_by  INTEGER REFERENCES users(id),
+                    submitted_at  TEXT                    -- NULL = still a draft
+                );
+
+                CREATE TABLE IF NOT EXISTS event_team (
+                    event_id  INTEGER NOT NULL REFERENCES events(id) ON DELETE CASCADE,
+                    user_id   INTEGER NOT NULL REFERENCES users(id),
+                    PRIMARY KEY (event_id, user_id)
+                );
+
+                -- crew members of a day who do not have a profile in the app
+                CREATE TABLE IF NOT EXISTS event_crew (
+                    event_id  INTEGER NOT NULL REFERENCES events(id) ON DELETE CASCADE,
+                    name      TEXT NOT NULL,
+                    PRIMARY KEY (event_id, name)
+                );
+
+                CREATE TABLE IF NOT EXISTS inventory_items (
+                    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                    event_id    INTEGER NOT NULL REFERENCES events(id) ON DELETE CASCADE,
+                    item_name   TEXT NOT NULL,
+                    unit        TEXT NOT NULL DEFAULT '',
+                    before_qty  REAL,                    -- counted before the event
+                    after_qty   REAL,                    -- counted after the event
+                    sort_order  INTEGER NOT NULL DEFAULT 0,
+                    UNIQUE (event_id, item_name)
+                );
+
+                CREATE TABLE IF NOT EXISTS photos (
+                    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                    event_id   INTEGER NOT NULL REFERENCES events(id) ON DELETE CASCADE,
+                    file_path  TEXT NOT NULL,
+                    taken_at   TEXT NOT NULL
+                );
+
+                -- pending work days booked in advance (not started yet)
+                CREATE TABLE IF NOT EXISTS bookings (
+                    work_date   TEXT PRIMARY KEY,         -- YYYY-MM-DD
+                    created_by  INTEGER REFERENCES users(id),
+                    created_at  TEXT NOT NULL
+                );
+
+                -- who did what to a day. event_id has no foreign key on purpose,
+                -- so the history of a deleted day is kept.
+                CREATE TABLE IF NOT EXISTS event_log (
+                    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                    event_id    INTEGER,
+                    event_date  TEXT NOT NULL,
+                    user_id     INTEGER REFERENCES users(id),
+                    action      TEXT NOT NULL,
+                    detail      TEXT NOT NULL DEFAULT '',
+                    created_at  TEXT NOT NULL
+                );
+                """
+            )
+            self._upgrade_old_tables(conn)
+
+    @staticmethod
+    def _upgrade_old_tables(conn):
+        """Open databases made by earlier versions of the app without losing data."""
+        items_cols = {r["name"] for r in conn.execute("PRAGMA table_info(inventory_items)")}
+        if "before_qty" not in items_cols:
+            conn.execute("ALTER TABLE inventory_items ADD COLUMN before_qty REAL")
+            conn.execute("ALTER TABLE inventory_items ADD COLUMN after_qty REAL")
+            conn.execute(
+                "ALTER TABLE inventory_items ADD COLUMN sort_order INTEGER NOT NULL DEFAULT 0"
+            )
+            if "quantity" in items_cols:
+                conn.execute("UPDATE inventory_items SET after_qty = quantity")
+
+        user_cols = {r["name"] for r in conn.execute("PRAGMA table_info(users)")}
+        if "pin_hash" not in user_cols:
+            conn.execute("ALTER TABLE users ADD COLUMN pin_hash TEXT")
+            conn.execute("ALTER TABLE users ADD COLUMN pin_salt TEXT")
+
+        # old free-text roles ("Team lead") become one of the three role keys
+        for row in conn.execute("SELECT id, role FROM users").fetchall():
+            fixed = normalize_role(row["role"])
+            if fixed != row["role"]:
+                conn.execute("UPDATE users SET role = ? WHERE id = ?", (fixed, row["id"]))
+
+    @staticmethod
+    def _log(conn, event_id, event_date, user_id, action, detail=""):
+        conn.execute(
+            "INSERT INTO event_log (event_id, event_date, user_id, action, detail, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (event_id, event_date, user_id, action, detail, _now()),
+        )
+
+    # ------------------------------------------------------------------ users
+    def add_user(self, name, role="crew", photo_path=None, pin=None):
+        role = normalize_role(role)
+        if role == ADMIN and self.has_admin():
+            raise ValueError("There is already a Creator admin.")
+        salt = pin_hash = None
+        if pin:
+            salt = os.urandom(16).hex()
+            pin_hash = _hash_pin(pin, salt)
+        with closing(self._connect()) as conn, conn:
+            cur = conn.execute(
+                "INSERT INTO users (name, role, photo_path, created_at, pin_hash, pin_salt) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (name.strip(), role, photo_path, _now(), pin_hash, salt),
+            )
+            return cur.lastrowid
+
+    def has_admin(self):
+        with closing(self._connect()) as conn:
+            row = conn.execute("SELECT 1 FROM users WHERE role = ?", (ADMIN,)).fetchone()
+        return row is not None
+
+    def list_users(self):
+        with closing(self._connect()) as conn:
+            return conn.execute("SELECT * FROM users ORDER BY name COLLATE NOCASE").fetchall()
+
+    def get_user(self, user_id):
+        with closing(self._connect()) as conn:
+            return conn.execute("SELECT * FROM users WHERE id = ?", (user_id,)).fetchone()
+
+    def verify_pin(self, user_id, pin):
+        """True if the PIN is right. A profile with no PIN always passes."""
+        user = self.get_user(user_id)
+        if user is None:
+            return False
+        if not user["pin_hash"]:
+            return True
+        guess = _hash_pin(pin or "", user["pin_salt"])
+        return hmac.compare_digest(guess, user["pin_hash"])
+
+    # ----------------------------------------------------------------- events
+    def count_events(self):
+        with closing(self._connect()) as conn:
+            return conn.execute("SELECT COUNT(*) FROM events").fetchone()[0]
+
+    def get_event(self, event_date):
+        with closing(self._connect()) as conn:
+            return conn.execute(
+                "SELECT * FROM events WHERE event_date = ?", (event_date,)
+            ).fetchone()
+
+    @staticmethod
+    def _items_of(conn, event_id):
+        rows = conn.execute(
+            """SELECT item_name, unit, before_qty, after_qty
+               FROM inventory_items WHERE event_id = ?
+               ORDER BY sort_order, id""",
+            (event_id,),
+        ).fetchall()
+        return [
+            {
+                "name": r["item_name"],
+                "unit": r["unit"],
+                "before": r["before_qty"],
+                "after": r["after_qty"],
+            }
+            for r in rows
+        ]
+
+    def get_items(self, event_id):
+        """Items in the order they were entered: {"name", "unit", "before", "after"}."""
+        with closing(self._connect()) as conn:
+            return self._items_of(conn, event_id)
+
+    def get_team(self, event_id):
+        """Crew who have a profile in the app."""
+        with closing(self._connect()) as conn:
+            return conn.execute(
+                """SELECT u.* FROM users u
+                   JOIN event_team t ON t.user_id = u.id
+                   WHERE t.event_id = ?
+                   ORDER BY u.name COLLATE NOCASE""",
+                (event_id,),
+            ).fetchall()
+
+    def get_crew_names(self, event_id):
+        """Extra crew members who were typed in by name (no profile)."""
+        with closing(self._connect()) as conn:
+            rows = conn.execute(
+                "SELECT name FROM event_crew WHERE event_id = ? ORDER BY rowid", (event_id,)
+            ).fetchall()
+        return [r["name"] for r in rows]
+
+    def save_event(
+        self,
+        event_date,
+        location,
+        items,
+        team_ids,
+        created_by,
+        crew_names=None,
+        allow_locked=False,
+        editor_id=None,
+    ):
+        """Create or update a day.
+
+        items      -> [{"name": "Hot cups", "unit": "cups", "before": 150, "after": 100}, ...]
+                      (before / after may be None while it is still a draft)
+        team_ids   -> user ids of crew who have a profile
+        crew_names -> extra crew names typed in by hand
+        A submitted day raises EventLockedError, unless allow_locked=True
+        (the Creator admin editing it), which is recorded in the day's history.
+        """
+        crew_names = [n.strip() for n in (crew_names or []) if n and n.strip()]
+        with closing(self._connect()) as conn, conn:
+            row = conn.execute(
+                "SELECT id, location, submitted_at FROM events WHERE event_date = ?",
+                (event_date,),
+            ).fetchone()
+            locked = row is not None and row["submitted_at"] is not None
+            if locked and not allow_locked:
+                raise EventLockedError("This day was already submitted and is locked.")
+
+            old = None
+            if row is None:
+                cur = conn.execute(
+                    "INSERT INTO events (event_date, location, created_by, created_at) "
+                    "VALUES (?, ?, ?, ?)",
+                    (event_date, location, created_by, _now()),
+                )
+                event_id = cur.lastrowid
+                self._log(conn, event_id, event_date, created_by, "created")
+            else:
+                event_id = row["id"]
+                if locked:
+                    old = {
+                        "location": row["location"],
+                        "items": self._items_of(conn, event_id),
+                        "team": {
+                            r["user_id"]
+                            for r in conn.execute(
+                                "SELECT user_id FROM event_team WHERE event_id = ?", (event_id,)
+                            )
+                        },
+                        "crew": {
+                            r["name"]
+                            for r in conn.execute(
+                                "SELECT name FROM event_crew WHERE event_id = ?", (event_id,)
+                            )
+                        },
+                    }
+                conn.execute(
+                    "UPDATE events SET location = ? WHERE id = ?", (location, event_id)
+                )
+
+            conn.execute("DELETE FROM inventory_items WHERE event_id = ?", (event_id,))
+            for position, item in enumerate(items):
+                conn.execute(
+                    "INSERT INTO inventory_items "
+                    "(event_id, item_name, unit, before_qty, after_qty, sort_order) "
+                    "VALUES (?, ?, ?, ?, ?, ?)",
+                    (
+                        event_id,
+                        item["name"],
+                        item["unit"],
+                        item["before"],
+                        item["after"],
+                        position,
+                    ),
+                )
+
+            conn.execute("DELETE FROM event_team WHERE event_id = ?", (event_id,))
+            for uid in sorted(set(team_ids)):
+                conn.execute(
+                    "INSERT INTO event_team (event_id, user_id) VALUES (?, ?)",
+                    (event_id, uid),
+                )
+            conn.execute("DELETE FROM event_crew WHERE event_id = ?", (event_id,))
+            for name in dict.fromkeys(crew_names):  # keeps order, drops duplicates
+                conn.execute(
+                    "INSERT INTO event_crew (event_id, name) VALUES (?, ?)", (event_id, name)
+                )
+
+            if old is not None:
+                new = {
+                    "location": location,
+                    "items": items,
+                    "team": set(team_ids),
+                    "crew": set(crew_names),
+                }
+                self._log(
+                    conn, event_id, event_date, editor_id or created_by,
+                    "admin_edit", _describe_changes(old, new),
+                )
+
+            # the day has started, so it is no longer just a booking
+            conn.execute("DELETE FROM bookings WHERE work_date = ?", (event_date,))
+            return event_id
+
+    def submit_event(self, event_id, user_id):
+        """Lock a day. After this, save_event() refuses to touch it."""
+        with closing(self._connect()) as conn, conn:
+            row = conn.execute(
+                "SELECT event_date, submitted_at FROM events WHERE id = ?", (event_id,)
+            ).fetchone()
+            if row is None:
+                raise ValueError("That day does not exist.")
+            if row["submitted_at"] is not None:
+                raise EventLockedError("This day was already submitted.")
+            conn.execute(
+                "UPDATE events SET submitted_by = ?, submitted_at = ? WHERE id = ?",
+                (user_id, _now(), event_id),
+            )
+            self._log(conn, event_id, row["event_date"], user_id, "submitted")
+
+    def delete_event(self, event_id, user_id):
+        """Remove a day with its items, crew and photos. The history line stays."""
+        with closing(self._connect()) as conn, conn:
+            row = conn.execute(
+                "SELECT event_date, location, submitted_at FROM events WHERE id = ?",
+                (event_id,),
+            ).fetchone()
+            if row is None:
+                raise ValueError("That day does not exist.")
+            state = "submitted" if row["submitted_at"] else "draft"
+            self._log(
+                conn, event_id, row["event_date"], user_id, "deleted",
+                f"{state} day at {row['location']}",
+            )
+            conn.execute("DELETE FROM events WHERE id = ?", (event_id,))
+
+    def get_log(self, event_id):
+        """History of one day, oldest first."""
+        with closing(self._connect()) as conn:
+            rows = conn.execute(
+                """SELECT l.action, l.detail, l.created_at, u.name AS user_name
+                   FROM event_log l LEFT JOIN users u ON u.id = l.user_id
+                   WHERE l.event_id = ? ORDER BY l.id""",
+                (event_id,),
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def month_status(self, year, month):
+        """Return {'2026-11-08': 'submitted' or 'draft'} for one month."""
+        prefix = f"{year:04d}-{month:02d}-"
+        with closing(self._connect()) as conn:
+            rows = conn.execute(
+                "SELECT event_date, submitted_at FROM events WHERE event_date LIKE ?",
+                (prefix + "%",),
+            ).fetchall()
+        return {
+            r["event_date"]: ("submitted" if r["submitted_at"] else "draft") for r in rows
+        }
+
+    # --------------------------------------------------------------- bookings
+    def add_booking(self, work_date, user_id):
+        """Mark a date as a pending work day."""
+        if self.get_event(work_date) is not None:
+            raise ValueError("That day already has a record.")
+        with closing(self._connect()) as conn, conn:
+            conn.execute(
+                "INSERT OR IGNORE INTO bookings (work_date, created_by, created_at) "
+                "VALUES (?, ?, ?)",
+                (work_date, user_id, _now()),
+            )
+
+    def remove_booking(self, work_date):
+        with closing(self._connect()) as conn, conn:
+            conn.execute("DELETE FROM bookings WHERE work_date = ?", (work_date,))
+
+    def has_booking(self, work_date):
+        with closing(self._connect()) as conn:
+            row = conn.execute(
+                "SELECT 1 FROM bookings WHERE work_date = ?", (work_date,)
+            ).fetchone()
+        return row is not None
+
+    def month_bookings(self, year, month):
+        prefix = f"{year:04d}-{month:02d}-"
+        with closing(self._connect()) as conn:
+            rows = conn.execute(
+                "SELECT work_date FROM bookings WHERE work_date LIKE ?", (prefix + "%",)
+            ).fetchall()
+        return {r["work_date"] for r in rows}
+
+    def next_booking(self, from_date):
+        """The soonest pending work day on or after from_date, or None."""
+        with closing(self._connect()) as conn:
+            row = conn.execute(
+                "SELECT MIN(work_date) AS d FROM bookings WHERE work_date >= ?", (from_date,)
+            ).fetchone()
+        return row["d"]
+
+    # ----------------------------------------------------------------- photos
+    def add_photo(self, event_id, file_path):
+        with closing(self._connect()) as conn, conn:
+            row = conn.execute(
+                "SELECT submitted_at FROM events WHERE id = ?", (event_id,)
+            ).fetchone()
+            if row is not None and row["submitted_at"] is not None:
+                raise EventLockedError("This day was already submitted and is locked.")
+            conn.execute(
+                "INSERT INTO photos (event_id, file_path, taken_at) VALUES (?, ?, ?)",
+                (event_id, file_path, _now()),
+            )
+
+    def get_photos(self, event_id):
+        with closing(self._connect()) as conn:
+            return conn.execute(
+                "SELECT * FROM photos WHERE event_id = ? ORDER BY taken_at", (event_id,)
+            ).fetchall()
