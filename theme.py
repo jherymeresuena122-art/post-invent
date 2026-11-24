@@ -21,6 +21,8 @@ INK = "#1F2430"
 MUTED = "#5B6270"
 LINE = "#D5CFC4"
 DANGER = "#B42318"
+ALERT = "#E60000"        # bright red: more cups used than the contract
+ALERT_SOFT = "#FFE1E1"
 
 # (soft background, dark letter) pairs used for profile circles
 TINTS = [

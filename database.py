@@ -41,6 +41,10 @@ def _describe_changes(old, new):
     notes = []
     if old["location"] != new["location"]:
         notes.append(f"location: {old['location']} -> {new['location']}")
+    if old["cups_target"] != new["cups_target"]:
+        notes.append(
+            f"cups to serve: {_show(old['cups_target'])} -> {_show(new['cups_target'])}"
+        )
     old_items = {i["name"]: i for i in old["items"]}
     new_items = {i["name"]: i for i in new["items"]}
     for name, item in new_items.items():
@@ -84,7 +88,9 @@ class Database:
                     photo_path  TEXT,
                     created_at  TEXT NOT NULL,
                     pin_hash    TEXT,
-                    pin_salt    TEXT
+                    pin_salt    TEXT,
+                    description TEXT NOT NULL DEFAULT '',
+                    deleted_at  TEXT                      -- NULL = account is active
                 );
 
                 CREATE TABLE IF NOT EXISTS events (
@@ -94,7 +100,8 @@ class Database:
                     created_by    INTEGER REFERENCES users(id),
                     created_at    TEXT NOT NULL,
                     submitted_by  INTEGER REFERENCES users(id),
-                    submitted_at  TEXT                    -- NULL = still a draft
+                    submitted_at  TEXT,                   -- NULL = still a draft
+                    cups_target   REAL                    -- cups the day's contract says to serve
                 );
 
                 CREATE TABLE IF NOT EXISTS event_team (
@@ -168,6 +175,18 @@ class Database:
             conn.execute("ALTER TABLE users ADD COLUMN pin_hash TEXT")
             conn.execute("ALTER TABLE users ADD COLUMN pin_salt TEXT")
 
+        event_cols = {r["name"] for r in conn.execute("PRAGMA table_info(events)")}
+        if "cups_target" not in event_cols:
+            conn.execute("ALTER TABLE events ADD COLUMN cups_target REAL")
+
+        if "description" not in user_cols:
+            conn.execute("ALTER TABLE users ADD COLUMN description TEXT NOT NULL DEFAULT ''")
+        if "deleted_at" not in user_cols:
+            conn.execute("ALTER TABLE users ADD COLUMN deleted_at TEXT")
+
+        # older versions saved the unit as "litres"; it is now spelled "liters"
+        conn.execute("UPDATE inventory_items SET unit = 'liters' WHERE unit = 'litres'")
+
         # old free-text roles ("Team lead") become one of the three role keys
         for row in conn.execute("SELECT id, role FROM users").fetchall():
             fixed = normalize_role(row["role"])
@@ -205,8 +224,11 @@ class Database:
         return row is not None
 
     def list_users(self):
+        """Active accounts only. Removed accounts keep their name in past days."""
         with closing(self._connect()) as conn:
-            return conn.execute("SELECT * FROM users ORDER BY name COLLATE NOCASE").fetchall()
+            return conn.execute(
+                "SELECT * FROM users WHERE deleted_at IS NULL ORDER BY name COLLATE NOCASE"
+            ).fetchall()
 
     def get_user(self, user_id):
         with closing(self._connect()) as conn:
@@ -215,12 +237,61 @@ class Database:
     def verify_pin(self, user_id, pin):
         """True if the PIN is right. A profile with no PIN always passes."""
         user = self.get_user(user_id)
-        if user is None:
+        if user is None or user["deleted_at"] is not None:
             return False
         if not user["pin_hash"]:
             return True
         guess = _hash_pin(pin or "", user["pin_salt"])
         return hmac.compare_digest(guess, user["pin_hash"])
+
+    def set_description(self, user_id, text):
+        with closing(self._connect()) as conn, conn:
+            conn.execute(
+                "UPDATE users SET description = ? WHERE id = ?", ((text or "").strip(), user_id)
+            )
+
+    def set_photo(self, user_id, photo_path):
+        """photo_path may be None to go back to the letter circle."""
+        with closing(self._connect()) as conn, conn:
+            conn.execute("UPDATE users SET photo_path = ? WHERE id = ?", (photo_path, user_id))
+
+    def set_pin(self, user_id, new_pin):
+        """Change a PIN (4 to 6 digits). Crew may clear it with an empty PIN."""
+        user = self.get_user(user_id)
+        if user is None or user["deleted_at"] is not None:
+            raise ValueError("That account does not exist.")
+        new_pin = (new_pin or "").strip()
+        if not new_pin:
+            if user["role"] != "crew":
+                raise ValueError("Creator admin and Team leader must keep a PIN.")
+            salt = pin_hash = None
+        else:
+            if not (new_pin.isdigit() and 4 <= len(new_pin) <= 6):
+                raise ValueError("The PIN must be 4 to 6 digits.")
+            salt = os.urandom(16).hex()
+            pin_hash = _hash_pin(new_pin, salt)
+        with closing(self._connect()) as conn, conn:
+            conn.execute(
+                "UPDATE users SET pin_hash = ?, pin_salt = ? WHERE id = ?",
+                (pin_hash, salt, user_id),
+            )
+
+    def delete_user(self, user_id):
+        """Remove an account from the app. Past days keep the person's name.
+
+        The Creator admin cannot be removed, so the app always has an admin.
+        """
+        user = self.get_user(user_id)
+        if user is None or user["deleted_at"] is not None:
+            raise ValueError("That account does not exist.")
+        if user["role"] == ADMIN:
+            raise ValueError("The Creator admin account cannot be deleted.")
+        with closing(self._connect()) as conn, conn:
+            conn.execute(
+                "UPDATE users SET deleted_at = ?, pin_hash = NULL, pin_salt = NULL, "
+                "photo_path = NULL, description = '' WHERE id = ?",
+                (_now(), user_id),
+            )
 
     # ----------------------------------------------------------------- events
     def count_events(self):
@@ -285,6 +356,7 @@ class Database:
         crew_names=None,
         allow_locked=False,
         editor_id=None,
+        cups_target=None,
     ):
         """Create or update a day.
 
@@ -292,13 +364,15 @@ class Database:
                       (before / after may be None while it is still a draft)
         team_ids   -> user ids of crew who have a profile
         crew_names -> extra crew names typed in by hand
+        cups_target-> cups the day's contract says to serve (or None)
         A submitted day raises EventLockedError, unless allow_locked=True
         (the Creator admin editing it), which is recorded in the day's history.
         """
         crew_names = [n.strip() for n in (crew_names or []) if n and n.strip()]
         with closing(self._connect()) as conn, conn:
             row = conn.execute(
-                "SELECT id, location, submitted_at FROM events WHERE event_date = ?",
+                "SELECT id, location, submitted_at, cups_target FROM events "
+                "WHERE event_date = ?",
                 (event_date,),
             ).fetchone()
             locked = row is not None and row["submitted_at"] is not None
@@ -308,9 +382,9 @@ class Database:
             old = None
             if row is None:
                 cur = conn.execute(
-                    "INSERT INTO events (event_date, location, created_by, created_at) "
-                    "VALUES (?, ?, ?, ?)",
-                    (event_date, location, created_by, _now()),
+                    "INSERT INTO events (event_date, location, created_by, created_at, "
+                    "cups_target) VALUES (?, ?, ?, ?, ?)",
+                    (event_date, location, created_by, _now(), cups_target),
                 )
                 event_id = cur.lastrowid
                 self._log(conn, event_id, event_date, created_by, "created")
@@ -319,6 +393,7 @@ class Database:
                 if locked:
                     old = {
                         "location": row["location"],
+                        "cups_target": row["cups_target"],
                         "items": self._items_of(conn, event_id),
                         "team": {
                             r["user_id"]
@@ -334,7 +409,8 @@ class Database:
                         },
                     }
                 conn.execute(
-                    "UPDATE events SET location = ? WHERE id = ?", (location, event_id)
+                    "UPDATE events SET location = ?, cups_target = ? WHERE id = ?",
+                    (location, cups_target, event_id),
                 )
 
             conn.execute("DELETE FROM inventory_items WHERE event_id = ?", (event_id,))
@@ -368,6 +444,7 @@ class Database:
             if old is not None:
                 new = {
                     "location": location,
+                    "cups_target": cups_target,
                     "items": items,
                     "team": set(team_ids),
                     "crew": set(crew_names),

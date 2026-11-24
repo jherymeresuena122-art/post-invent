@@ -7,7 +7,7 @@ from datetime import datetime
 
 from PIL import Image, ImageDraw, ImageFont
 
-from units import fmt
+from units import cup_status, fmt
 
 WIDTH = 1240          # about A4 width at 150 dpi
 MARGIN = 80
@@ -20,6 +20,8 @@ MUTED = (91, 98, 112)
 LINE = (213, 207, 196)
 ROW_ALT = (246, 243, 238)
 DANGER = (180, 35, 24)
+ALERT = (230, 0, 0)
+ALERT_SOFT = (255, 225, 225)
 WHITE = (255, 255, 255)
 
 
@@ -113,18 +115,27 @@ def _draw(draw, data, fonts):
     # cups total
     if data.get("cups"):
         before, after, used = data["cups"]
+        target = data.get("cups_target")
+        left, over = cup_status(target, used)
+        box_h = 215 if target is not None else 160
         y += 34
-        draw.rectangle([MARGIN, y, WIDTH - MARGIN, y + 160], fill=TEAL_SOFT)
-        draw.text((MARGIN + 24, y + 16), "Cups total (hot + cold)", font=bold, fill=TEAL)
-        columns = (
-            ("Before", before, MARGIN + 24),
-            ("After", after, MARGIN + 24 + (WIDTH - 2 * MARGIN) // 3),
-            ("Consumed", used, MARGIN + 24 + 2 * (WIDTH - 2 * MARGIN) // 3),
-        )
-        for label, value, x in columns:
+        draw.rectangle([MARGIN, y, WIDTH - MARGIN, y + box_h], fill=ALERT_SOFT if over else TEAL_SOFT)
+        draw.text((MARGIN + 24, y + 16), "Cups total (hot + cold)", font=bold, fill=ALERT if over else TEAL)
+        columns = [("Before", before), ("After", after), ("Consumed", used)]
+        if target is not None:
+            columns.insert(0, ("Contracted", target))
+        step = (WIDTH - 2 * MARGIN) // len(columns)
+        for index, (label, value) in enumerate(columns):
+            x = MARGIN + 24 + index * step
             draw.text((x, y + 60), label, font=small, fill=MUTED)
-            draw.text((x, y + 88), fmt(value), font=title, fill=INK)
-        y += 160
+            draw.text((x, y + 88), fmt(value), font=title, fill=ALERT if (over and label == "Consumed") else INK)
+        if target is not None and left is not None:
+            if over:
+                text, color = f"OVER the contract by {fmt(-left)} cups", ALERT
+            else:
+                text, color = f"Left to serve: {fmt(left)} cups", TEAL
+            draw.text((MARGIN + 24, y + 160), text, font=bold, fill=color)
+        y += box_h
 
     # history
     if data["history"]:
@@ -147,7 +158,8 @@ def build_report(data, regular_font=None, bold_font=None):
 
     data keys: title, date_text, location, crew_text, status_text,
                items [{name, unit, before, after, used}], cups (before, after,
-               consumed) or None, history [str], generated_text
+               consumed) or None, cups_target (number or None), history [str],
+               generated_text
     """
     fonts = {
         "title": load_font(bold_font, 46),

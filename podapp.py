@@ -23,19 +23,22 @@ from kivy.resources import resource_find
 from kivy.uix.behaviors import ButtonBehavior
 from kivy.uix.boxlayout import BoxLayout
 from kivy.uix.button import Button
-from kivy.uix.filechooser import FileChooserListView
 from kivy.uix.floatlayout import FloatLayout
 from kivy.uix.label import Label
+from kivy.uix.modalview import ModalView
 from kivy.uix.popup import Popup
-from kivy.uix.screenmanager import Screen, ScreenManager, SlideTransition
+from kivy.uix.screenmanager import FadeTransition, Screen, ScreenManager, SlideTransition
 from kivy.uix.spinner import Spinner
 from kivy.uix.textinput import TextInput
 from kivy.uix.togglebutton import ToggleButton
 from kivy.uix.widget import Widget
 from kivy.utils import escape_markup, platform
 
+import storage_access
 import theme
 from database import Database, EventLockedError
+from folderpicker import FolderPicker
+from imaging import make_avatar, remove_file
 from permissions import (
     ADMIN,
     CREW,
@@ -48,7 +51,7 @@ from permissions import (
     start_denied_reason,
 )
 from report import build_report, save_report, timestamp_text
-from units import DEFAULT_ITEMS, consumed, cup_totals, fmt, parse_number
+from units import DEFAULT_ITEMS, consumed, cup_status, cup_totals, fmt, parse_number
 
 # On a computer, show the app at roughly the size of a phone screen.
 if platform not in ("android", "ios"):
@@ -97,6 +100,7 @@ class Avatar(FloatLayout):
     tint = ListProperty([1, 1, 1, 1])
     ink = ListProperty([0, 0, 0, 1])
     d = NumericProperty(0)
+    source = StringProperty("")      # profile picture file, or "" for the letter
 
 
 class UserTile(ButtonBehavior, BoxLayout):
@@ -106,20 +110,76 @@ class UserTile(ButtonBehavior, BoxLayout):
     tint = ListProperty([1, 1, 1, 1])
     ink = ListProperty([0, 0, 0, 1])
     user_id = NumericProperty(0)
+    photo = StringProperty("")
 
 
 class PodScreen(Screen):
     """Base class: every screen gets the paper-colored background."""
 
 
+class LoadingScreen(PodScreen):
+    """Shown first: a cup that fills with coffee while the app gets ready."""
+
+    FRAMES = 21                      # cup_00.png (empty) ... cup_20.png (full)
+    frame_source = StringProperty("")
+    bg_source = StringProperty("")
+    status_text = StringProperty("Getting things ready...")
+
+    def __init__(self, **kwargs):
+        self.assets = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets")
+        super().__init__(**kwargs)
+        self.bg_source = os.path.join(self.assets, "loader_bg.png")
+        self.show(0.0)
+
+    def show(self, progress):
+        progress = max(0.0, min(1.0, progress))
+        index = min(self.FRAMES - 1, int(progress * (self.FRAMES - 1) + 0.5))
+        self.frame_source = os.path.join(self.assets, "loader", f"cup_{index:02d}.png")
+        self.status_text = (
+            "Ready!" if progress >= 1 else f"Getting things ready... {int(progress * 100)}%"
+        )
+
+
 class UnitSpinner(Spinner):
     """Drop-down to pick how an item is counted (cups, bags, grams...)."""
 
 
+class DriveSheet(BoxLayout):
+    """A clean full-screen sheet with a back arrow, like a cloud-drive app."""
+
+    title = StringProperty("")
+    subtitle = StringProperty("")
+
+    def __init__(self, **kwargs):
+        self.register_event_type("on_back")
+        super().__init__(**kwargs)
+
+    def on_back(self, *args):
+        pass
+
+
+def open_sheet(sheet):
+    """Show a DriveSheet over the whole screen. Returns the view (call .dismiss())."""
+    view = ModalView(
+        size_hint=(1, 1),
+        auto_dismiss=False,
+        background="",
+        background_color=(0, 0, 0, 0),
+        overlay_color=(0, 0, 0, 0),
+    )
+    view.add_widget(sheet)
+    sheet.bind(on_back=lambda *_: view.dismiss())
+    view.open()
+    return view
+
+
 class TotalsCard(BoxLayout):
+    target_text = StringProperty("-")
     before_text = StringProperty("-")
     after_text = StringProperty("-")
     used_text = StringProperty("-")
+    status_text = StringProperty("")
+    over = BooleanProperty(False)       # more cups used than the contract: shown in bright red
 
 
 def set_visible(widget, visible, height=None):
@@ -207,16 +267,15 @@ def input_popup(title, hint, ok_text, on_ok, password=False, digits_only=False, 
 
 def default_export_folder(app):
     """A sensible place to start looking for where to save the export."""
-    if platform == "android":
-        try:
-            from android.storage import primary_external_storage_path
-
-            folder = os.path.join(primary_external_storage_path(), "Download")
-            if os.path.isdir(folder):
+    root = storage_access.phone_storage_root()
+    if root is not None:  # Android
+        for sub in ("Documents", "Download"):
+            folder = os.path.join(root, sub)
+            if storage_access.has_all_files_access() and os.path.isdir(folder):
                 return folder
-        except Exception:
-            pass
-        return app.user_data_dir
+        folder = os.path.join(app.user_data_dir, "exports")
+        os.makedirs(folder, exist_ok=True)
+        return folder
     home = os.path.expanduser("~")
     for sub in ("Documents", "Downloads"):
         folder = os.path.join(home, sub)
@@ -225,91 +284,198 @@ def default_export_folder(app):
     return home
 
 
+def quick_places(app):
+    """Extra shortcut chips: the phone's storage and the app's own folder."""
+    places = []
+    root = storage_access.phone_storage_root()
+    if root:
+        places.append(("Phone", root))
+        for sub in ("DCIM", "Download", "Documents", "Pictures"):
+            places.append((sub, os.path.join(root, sub)))
+    places.append(("This app", app.user_data_dir))
+    return places
+
+
+def folder_name_of(path):
+    return os.path.basename(os.path.normpath(path)) or path
+
+
 def export_popup(app, data, base_name):
-    """Pick PDF or PNG and a folder, then save the day as a picture."""
-    content = BoxLayout(orientation="vertical", padding=dp(12), spacing=dp(8))
-    formats = BoxLayout(size_hint_y=None, height=dp(52), spacing=dp(8))
+    """A Drive-style 'Save to' screen: pick a folder (or make one), PNG or PDF, then save."""
+    sheet = DriveSheet(title="Save to")
+    picker = FolderPicker(
+        default_export_folder(app), input_popup, places=quick_places(app)
+    )
+    sheet.subtitle = folder_name_of(picker.path)
+    picker.bind(path=lambda w, value: setattr(sheet, "subtitle", folder_name_of(value)))
+    sheet.ids.body.add_widget(picker)
+
+    formats = BoxLayout(size_hint_y=None, height=dp(46), spacing=dp(8))
     png = RoleToggle(text="PNG picture", group="export_format", role_key="png", state="down")
     pdf = RoleToggle(text="PDF file", group="export_format", role_key="pdf")
     formats.add_widget(png)
     formats.add_widget(pdf)
-
-    start = default_export_folder(app)
-    path_input = PodInput(text=start, height=dp(44))
-    chooser = FileChooserListView(
-        path=start,
-        dirselect=True,
-        filters=[lambda folder, name: os.path.isdir(os.path.join(folder, name))],
-    )
-    chooser.bind(path=lambda w, value: setattr(path_input, "text", value))
-    chooser.bind(selection=lambda w, sel: setattr(path_input, "text", sel[0]) if sel else None)
     message = PodLabel(text="", font_size="13sp", color=theme.rgba(theme.DANGER))
-
-    row = BoxLayout(size_hint_y=None, height=dp(52), spacing=dp(10))
-    popup = Popup(
-        title="Export this day",
-        content=content,
-        size_hint=(0.95, 0.92),
-        auto_dismiss=False,
-    )
-    close = PodButton(text="Close", bg=theme.rgba(theme.LINE), fg=theme.rgba(theme.INK))
-    close.bind(on_release=lambda *_: popup.dismiss())
+    save = PodButton(text="Save here")
+    footer = sheet.ids.footer
+    footer.add_widget(formats)
+    footer.add_widget(message)
+    footer.add_widget(save)
 
     def _export(*_):
-        folder = path_input.text.strip()
-        if not os.path.isdir(folder):
-            message.color = theme.rgba(theme.DANGER)
-            message.text = "That folder does not exist. Pick a folder from the list."
-            return
         try:
             image = build_report(
                 data,
                 resource_find("data/fonts/Roboto-Regular.ttf"),
                 resource_find("data/fonts/Roboto-Bold.ttf"),
             )
-            path = save_report(image, folder, base_name, "pdf" if pdf.state == "down" else "png")
+            path = save_report(
+                image, picker.path, base_name, "pdf" if pdf.state == "down" else "png"
+            )
+        except PermissionError:
+            message.color = theme.rgba(theme.DANGER)
+            message.text = (
+                "Android does not let the app save here. Allow access to all files, "
+                "or pick 'This app'."
+            )
+            return
         except Exception as err:  # show any problem instead of crashing the app
             message.color = theme.rgba(theme.DANGER)
             message.text = f"Could not save: {err}"
             return
         message.color = theme.rgba(theme.TEAL_DARK)
-        message.text = f"Saved: {path}"
+        message.text = f"Saved: {os.path.basename(path)}"
+        picker.reload()
 
-    export = PodButton(text="Export")
-    export.bind(on_release=_export)
-    row.add_widget(close)
-    row.add_widget(export)
+    save.bind(on_release=_export)
+    open_sheet(sheet)
 
-    content.add_widget(PodLabel(text="1. Choose the format", bold=True, font_size="13sp"))
-    content.add_widget(formats)
-    content.add_widget(PodLabel(text="2. Choose the folder to save in", bold=True, font_size="13sp"))
-    content.add_widget(path_input)
-    content.add_widget(chooser)
-    content.add_widget(message)
-    content.add_widget(row)
-    popup.open()
+
+def photo_popup(app, on_chosen):
+    """A Drive-style screen to browse for a picture. on_chosen(path) gets the file."""
+    start = None
+    root = storage_access.phone_storage_root()
+    candidates = []
+    if root:
+        candidates += [os.path.join(root, "DCIM", "Camera"), os.path.join(root, "Pictures"), root]
+    candidates += [os.path.expanduser("~/Pictures"), os.path.expanduser("~")]
+    for folder in candidates:
+        if os.path.isdir(folder):
+            start = folder
+            break
+
+    sheet = DriveSheet(title="Choose a picture")
+    holder = {}
+
+    def _picked(path):
+        holder["view"].dismiss()
+        on_chosen(path)
+
+    picker = FolderPicker(
+        start or app.user_data_dir, input_popup, on_file=_picked, show_files=True,
+        places=quick_places(app),
+    )
+    sheet.subtitle = folder_name_of(picker.path)
+    picker.bind(path=lambda w, value: setattr(sheet, "subtitle", folder_name_of(value)))
+    sheet.ids.body.add_widget(picker)
+    holder["view"] = open_sheet(sheet)
 
 
 # -------------------------------------------------------------------- screens
+def photo_of(user):
+    """The picture file of an account, or '' when there is none."""
+    path = user["photo_path"]
+    return path if path and os.path.isfile(path) else ""
+
+
 class ChooseUserScreen(PodScreen):
+    managing = BooleanProperty(False)
+
     def on_pre_enter(self, *args):
+        self.managing = False
+        self.refresh()
+
+    def refresh(self):
         app = App.get_running_app()
         grid = self.ids.grid
         grid.clear_widgets()
         users = app.db.list_users()
         self.ids.empty_hint.opacity = 0 if users else 1
+        self.ids.manage_btn.text = "Done" if self.managing else "Manage accounts"
         for i, user in enumerate(users):
             soft, dark = theme.TINTS[i % len(theme.TINTS)]
             tile = UserTile(
                 initial=user["name"][:1].upper(),
                 username=user["name"],
-                role_text=role_label(user["role"]),
+                role_text="Tap to remove" if self.managing else role_label(user["role"]),
                 tint=theme.rgba(soft),
                 ink=theme.rgba(dark),
                 user_id=user["id"],
+                photo=photo_of(user),
             )
-            tile.bind(on_release=lambda w: app.try_login(w.user_id))
+            tile.bind(on_release=self.tile_tapped)
             grid.add_widget(tile)
+
+    def tile_tapped(self, tile):
+        app = App.get_running_app()
+        if not self.managing:
+            app.try_login(tile.user_id)
+            return
+        user = app.db.get_user(tile.user_id)
+        if user is None:
+            return
+        if user["role"] == ADMIN:
+            confirm_popup(
+                "Creator admin",
+                "The Creator admin account can't be removed.",
+                "OK", lambda: None, 240,
+            )
+            return
+        confirm_popup(
+            f"Remove {user['name']}?",
+            "They will no longer be able to sign in. Days they worked keep their name.",
+            "Yes, remove",
+            lambda: self.remove_user(user["id"]),
+            300,
+        )
+
+    def remove_user(self, user_id):
+        app = App.get_running_app()
+        user = app.db.get_user(user_id)
+        try:
+            app.db.delete_user(user_id)
+        except ValueError:
+            return
+        if user is not None:
+            remove_file(user["photo_path"])
+        self.refresh()
+
+    def toggle_manage(self):
+        app = App.get_running_app()
+        if self.managing:
+            self.managing = False
+            self.refresh()
+            return
+        admin = next((u for u in app.db.list_users() if u["role"] == ADMIN), None)
+        if admin is None:
+            confirm_popup(
+                "Manage accounts",
+                "Only the Creator admin can remove accounts, and none exists yet.",
+                "OK", lambda: None, 260,
+            )
+            return
+
+        def check(pin):
+            if app.db.verify_pin(admin["id"], pin):
+                self.managing = True
+                self.refresh()
+                return ""
+            return "Wrong PIN."
+
+        input_popup(
+            f"Creator admin PIN ({admin['name']})", "PIN", "Open", check,
+            password=True, digits_only=True, max_length=6,
+        )
 
 
 class CreateAccountScreen(PodScreen):
@@ -378,6 +544,132 @@ class CreateAccountScreen(PodScreen):
 class HomeScreen(PodScreen):
     def on_pre_enter(self, *args):
         App.get_running_app().refresh_totals()
+
+
+class AccountScreen(PodScreen):
+    """Picture, description, PIN and deleting your own account."""
+
+    def on_pre_enter(self, *args):
+        app = App.get_running_app()
+        ids = self.ids
+        user = app.db.get_user(app.current_user_id)
+        ids.desc_input.text = user["description"] if user else ""
+        for field in (ids.old_pin, ids.new_pin, ids.new_pin2):
+            field.text = ""
+        ids.message.text = ""
+        has_pin = bool(user and user["pin_hash"])
+        ids.old_pin.disabled = not has_pin
+        ids.old_pin.opacity = 1 if has_pin else 0.4
+        ids.pin_title.text = "Change PIN" if has_pin else "Set a PIN (optional)"
+        is_admin = app.current_user_role == ADMIN
+        set_visible(ids.delete_btn, not is_admin, dp(52))
+        ids.delete_note.text = (
+            "The Creator admin account can't be deleted." if is_admin else
+            "Deleting your account keeps the days you worked, with your name on them."
+        )
+        ids.remove_photo_btn.disabled = not app.current_user_photo
+
+    def _say(self, text, good=False):
+        self.ids.message.color = theme.rgba(theme.TEAL_DARK if good else theme.DANGER)
+        self.ids.message.text = text
+
+    # ----- picture
+    def pick_photo(self):
+        app = App.get_running_app()
+        photo_popup(app, self._use_photo)
+
+    def _use_photo(self, path):
+        app = App.get_running_app()
+        user = app.db.get_user(app.current_user_id)
+        try:
+            folder = os.path.join(app.user_data_dir, "avatars")
+            new_path = make_avatar(path, folder, f"user{app.current_user_id}")
+        except Exception as err:
+            self._say(f"Could not use that picture: {err}")
+            return
+        if user is not None:
+            remove_file(user["photo_path"])
+        app.db.set_photo(app.current_user_id, new_path)
+        app.current_user_photo = new_path
+        self.ids.remove_photo_btn.disabled = False
+        self._say("Picture saved.", good=True)
+
+    def remove_photo(self):
+        app = App.get_running_app()
+        user = app.db.get_user(app.current_user_id)
+        if user is not None:
+            remove_file(user["photo_path"])
+        app.db.set_photo(app.current_user_id, None)
+        app.current_user_photo = ""
+        self.ids.remove_photo_btn.disabled = True
+        self._say("Picture removed.", good=True)
+
+    # ----- description
+    def save_description(self):
+        app = App.get_running_app()
+        app.db.set_description(app.current_user_id, self.ids.desc_input.text)
+        self._say("Description saved.", good=True)
+
+    # ----- PIN
+    def change_pin(self):
+        app = App.get_running_app()
+        ids = self.ids
+        user = app.db.get_user(app.current_user_id)
+        if user["pin_hash"] and not app.db.verify_pin(user["id"], ids.old_pin.text.strip()):
+            self._say("The current PIN is wrong.")
+            return
+        new, again = ids.new_pin.text.strip(), ids.new_pin2.text.strip()
+        if new != again:
+            self._say("The two new PINs do not match.")
+            return
+        try:
+            app.db.set_pin(user["id"], new)
+        except ValueError as err:
+            self._say(str(err))
+            return
+        for field in (ids.old_pin, ids.new_pin, ids.new_pin2):
+            field.text = ""
+        self.on_pre_enter()
+        self._say("PIN changed." if new else "PIN removed.", good=True)
+
+    # ----- delete my account
+    def ask_delete(self):
+        confirm_popup(
+            "Delete your account?",
+            "You will be signed out and can't sign in again. "
+            "Days you worked keep your name.",
+            "Yes, delete",
+            self._confirm_pin_then_delete,
+            320,
+        )
+
+    def _confirm_pin_then_delete(self):
+        app = App.get_running_app()
+        user = app.db.get_user(app.current_user_id)
+        if not user["pin_hash"]:
+            self._delete()
+            return
+
+        def check(pin):
+            if app.db.verify_pin(user["id"], pin):
+                self._delete()
+                return ""
+            return "Wrong PIN."
+
+        input_popup("Type your PIN to confirm", "PIN", "Delete", check,
+                    password=True, digits_only=True, max_length=6)
+
+    def _delete(self):
+        app = App.get_running_app()
+        user = app.db.get_user(app.current_user_id)
+        try:
+            app.db.delete_user(app.current_user_id)
+        except ValueError as err:
+            self._say(str(err))
+            return
+        if user is not None:
+            remove_file(user["photo_path"])
+        app.logout()
 
 
 class CalendarScreen(PodScreen):
@@ -456,7 +748,18 @@ class CalendarScreen(PodScreen):
 
         if event is not None:
             lines = [f"[b]{nice}[/b]", f"Location: {escape_markup(event['location'])}"]
-            for it in app.db.get_items(event["id"]):
+            day_items = app.db.get_items(event["id"])
+            if event["cups_target"] is not None:
+                _, _, cups_used = cup_totals(day_items)
+                left, over = cup_status(event["cups_target"], cups_used)
+                lines.append(f"Contracted cups: {fmt(event['cups_target'])}")
+                if over:
+                    lines.append(
+                        f"[color=e60000][b]OVER the contract by {fmt(-left)} cups[/b][/color]"
+                    )
+                elif left is not None:
+                    lines.append(f"Left to serve: {fmt(left)} cups")
+            for it in day_items:
                 used = consumed(it["before"], it["after"])
                 lines.append(
                     f"{escape_markup(it['name'])}: {fmt(it['before'])} before, "
@@ -646,7 +949,26 @@ class CreateDayScreen(PodScreen):
             {"unit": r.item_unit, "before": r.before, "after": r.after} for r in self.item_rows()
         ]
         before, after, used = cup_totals(data)
-        card.before_text, card.after_text, card.used_text = fmt(before), fmt(after), fmt(used)
+        target = self._target()
+        left, over = cup_status(target, used)
+        card.target_text, card.before_text = fmt(target), fmt(before)
+        card.after_text, card.used_text = fmt(after), fmt(used)
+        card.over = over
+        if left is None:
+            card.status_text = (
+                "Type the contracted cups above to compare." if target is None else ""
+            )
+        elif over:
+            card.status_text = f"OVER the contract by {fmt(-left)} cups"
+        else:
+            card.status_text = f"Left to serve: {fmt(left)} cups"
+
+    def _target(self):
+        """The contracted cups typed at the top, or None."""
+        return parse_number(self.ids.target_input.text)
+
+    def on_kv_post(self, base_widget):
+        self.ids.target_input.bind(text=lambda *_: self.update_summary())
 
     # ------------------------------------------------------------ crew chips
     def _add_chip(self, text, user_id, down):
@@ -693,6 +1015,7 @@ class CreateDayScreen(PodScreen):
 
         ids.date_input.text = date_str
         ids.loc_input.text = event["location"] if event else ""
+        ids.target_input.text = _text(event["cups_target"]) if event else ""
 
         ids.items_box.clear_widgets()
         self.totals_card = TotalsCard()
@@ -707,8 +1030,14 @@ class CreateDayScreen(PodScreen):
 
         ids.team_box.clear_widgets()
         self.team_toggles = []
+        active_ids = set()
         for user in app.db.list_users():
+            active_ids.add(user["id"])
             self._add_chip(user["name"], user["id"], user["id"] in team_ids)
+        if event is not None:  # people whose account was removed stay on the days they worked
+            for user in app.db.get_team(event["id"]):
+                if user["id"] not in active_ids:
+                    self._add_chip(user["name"], user["id"], True)
         for name in crew_names:
             self._add_chip(name, 0, True)
 
@@ -737,7 +1066,7 @@ class CreateDayScreen(PodScreen):
         ids = self.ids
         fields_on = self._fields_on()
 
-        for widget in (ids.loc_input, ids.add_item_btn, ids.add_crew_btn):
+        for widget in (ids.loc_input, ids.target_input, ids.add_item_btn, ids.add_crew_btn):
             widget.disabled = not fields_on
             widget.opacity = 1 if fields_on else 0.6
         for row in self.item_rows():
@@ -783,6 +1112,12 @@ class CreateDayScreen(PodScreen):
             )
         if strict and not items:
             raise ValueError("Add at least one item.")
+        _, over = cup_status(self._target(), cup_totals(items)[2])
+        if over:
+            warnings.append(
+                f"Cups consumed ({fmt(cup_totals(items)[2])}) is more than the "
+                f"contracted {fmt(self._target())}"
+            )
 
         team_ids = [t.user_id for t in self.team_toggles if t.state == "down" and t.user_id]
         crew_names = [t.text for t in self.team_toggles if t.state == "down" and not t.user_id]
@@ -808,6 +1143,7 @@ class CreateDayScreen(PodScreen):
                 crew_names=crew_names,
                 allow_locked=self.admin_editing,
                 editor_id=app.current_user_id,
+                cups_target=self._target(),
             )
         except (ValueError, EventLockedError) as err:
             self._say(str(err))
@@ -844,7 +1180,8 @@ class CreateDayScreen(PodScreen):
         try:
             date_str, location, items, team_ids, crew_names, _ = self._collect(strict=True)
             event_id = app.db.save_event(
-                date_str, location, items, team_ids, app.current_user_id, crew_names=crew_names
+                date_str, location, items, team_ids, app.current_user_id,
+                crew_names=crew_names, cups_target=self._target(),
             )
             app.db.submit_event(event_id, app.current_user_id)
         except (ValueError, EventLockedError) as err:
@@ -923,7 +1260,8 @@ class CreateDayScreen(PodScreen):
                     line += f": {entry['detail']}"
                 history.append(line)
 
-        names = [u["name"] for u in app.db.list_users() if u["id"] in team_ids] + crew_names
+        profiles = [app.db.get_user(uid) for uid in sorted(team_ids)]
+        names = sorted(u["name"] for u in profiles if u is not None) + crew_names
         rows = [
             dict(it, used=consumed(it["before"], it["after"])) for it in items
         ]
@@ -936,6 +1274,7 @@ class CreateDayScreen(PodScreen):
             "status_text": status_text,
             "items": rows,
             "cups": cup_totals(items) if has_cups else None,
+            "cups_target": self._target() if has_cups else None,
             "history": history,
             "generated_text": timestamp_text(),
         }
@@ -949,6 +1288,7 @@ class PodInventoryApp(App):
     current_user_role = StringProperty(CREW)       # ADMIN, LEADER or CREW
     current_user_role_text = StringProperty("")
     current_user_initial = StringProperty("")
+    current_user_photo = StringProperty("")
     total_events = NumericProperty(0)
     next_duty_text = StringProperty("")
     target_date = StringProperty("")
@@ -968,14 +1308,45 @@ class PodInventoryApp(App):
     def build(self):
         self.title = "The Pod Inventory"
         self._ensure_kv()
-        self.db = Database(os.path.join(self.user_data_dir, "pod_inventory.db"))
         manager = ScreenManager(transition=SlideTransition(duration=0.18))
-        manager.add_widget(ChooseUserScreen(name="choose"))
-        manager.add_widget(CreateAccountScreen(name="create_account"))
-        manager.add_widget(HomeScreen(name="home"))
-        manager.add_widget(CalendarScreen(name="calendar"))
-        manager.add_widget(CreateDayScreen(name="create_day"))
+        self.loading = LoadingScreen(name="loading")
+        manager.add_widget(self.loading)          # the first screen: the filling cup
+        self._boot_steps = [
+            self._boot_database,
+            lambda: manager.add_widget(ChooseUserScreen(name="choose")),
+            lambda: manager.add_widget(CreateAccountScreen(name="create_account")),
+            lambda: manager.add_widget(HomeScreen(name="home")),
+            lambda: manager.add_widget(AccountScreen(name="account")),
+            lambda: manager.add_widget(CalendarScreen(name="calendar")),
+            lambda: manager.add_widget(CreateDayScreen(name="create_day")),
+        ]
+        self._boot_done = 0
+        self._boot_progress = 0.0
+        Clock.schedule_once(self._boot_tick, 0.3)
         return manager
+
+    def _boot_database(self):
+        self.db = Database(os.path.join(self.user_data_dir, "pod_inventory.db"))
+
+    def _boot_tick(self, dt):
+        """Do the real start-up work one piece at a time while the cup fills."""
+        total = len(self._boot_steps)
+        self._boot_progress = min(1.0, self._boot_progress + 0.05)
+        while self._boot_done < total and self._boot_progress >= self._boot_done / total:
+            self._boot_steps[self._boot_done]()
+            self._boot_done += 1
+        self.loading.show(self._boot_progress)
+        if self._boot_progress >= 1.0 and self._boot_done >= total:
+            Clock.schedule_once(self._boot_finish, 0.35)
+        else:
+            Clock.schedule_once(self._boot_tick, 0.08)
+
+    def _boot_finish(self, dt):
+        self.root.transition = FadeTransition(duration=0.3)
+        self.root.current = "choose"
+        Clock.schedule_once(
+            lambda _dt: setattr(self.root, "transition", SlideTransition(duration=0.18)), 0.6
+        )
 
     def go(self, screen_name, direction="left"):
         self.root.transition.direction = direction
@@ -993,7 +1364,7 @@ class PodInventoryApp(App):
     def try_login(self, user_id):
         """Open a profile. Profiles with a PIN ask for it first."""
         user = self.db.get_user(user_id)
-        if user is None:
+        if user is None or user["deleted_at"] is not None:
             return
         if not user["pin_hash"]:
             self.login(user_id)
@@ -1019,6 +1390,7 @@ class PodInventoryApp(App):
         self.current_user_role = user["role"]
         self.current_user_role_text = role_label(user["role"])
         self.current_user_initial = user["name"][:1].upper()
+        self.current_user_photo = photo_of(user)
         self.refresh_totals()
         self.go("home")
 
@@ -1027,6 +1399,7 @@ class PodInventoryApp(App):
         self.current_user_name = ""
         self.current_user_role = CREW
         self.current_user_role_text = ""
+        self.current_user_photo = ""
         self.go("choose", "right")
 
 

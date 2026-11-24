@@ -52,12 +52,23 @@
     disabled_foreground_color: rgba(theme.MUTED)
     hint_text_color: rgba(theme.MUTED)
     cursor_color: rgba(theme.TEAL)
+
+<BorderedInput@PodInput>:
     canvas.after:
         Color:
             rgba: rgba(theme.LINE)
         Line:
             rounded_rectangle: [self.x, self.y, self.width, self.height, dp(12)]
             width: 1
+
+# Smoother scrolling: no bounce maths, scroll sideways is off, small bar.
+<ScrollView>:
+    effect_cls: 'ScrollEffect'
+    do_scroll_x: False
+    scroll_type: ['bars', 'content']
+    bar_width: dp(4)
+    scroll_distance: dp(12)
+    scroll_timeout: 150
 
 <TeamToggle>:
     background_normal: ''
@@ -142,8 +153,15 @@
         Ellipse:
             pos: self.pos
             size: self.size
+        Color:
+            rgba: (1, 1, 1, 1) if self.source else (0, 0, 0, 0)
+        Ellipse:
+            pos: self.pos
+            size: self.size
+            source: self.source
     Label:
         text: root.letter
+        opacity: 0 if root.source else 1
         bold: True
         font_size: root.d * 0.38
         color: root.ink
@@ -164,6 +182,7 @@
             letter: root.initial
             tint: root.tint
             ink: root.ink
+            source: root.photo
     Label:
         text: root.username
         bold: True
@@ -187,53 +206,360 @@
 <TotalsCard>:
     orientation: 'vertical'
     size_hint_y: None
-    height: dp(112)
+    height: dp(172)
     padding: dp(14), dp(10)
     spacing: dp(4)
     canvas.before:
         Color:
-            rgba: rgba(theme.TEAL_SOFT)
+            rgba: rgba(theme.ALERT_SOFT) if self.over else rgba(theme.TEAL_SOFT)
         RoundedRectangle:
             pos: self.pos
             size: self.size
             radius: [dp(16)]
+        Color:
+            rgba: rgba(theme.ALERT) if self.over else (0, 0, 0, 0)
+        Line:
+            rounded_rectangle: [self.x, self.y, self.width, self.height, dp(16)]
+            width: dp(2)
     PodLabel:
         text: 'Cups total (hot + cold)'
         bold: True
         font_size: '14sp'
-        color: rgba(theme.TEAL_DARK)
+        color: rgba(theme.ALERT) if root.over else rgba(theme.TEAL_DARK)
     BoxLayout:
-        spacing: dp(8)
+        spacing: dp(6)
+        BoxLayout:
+            orientation: 'vertical'
+            PodLabel:
+                text: 'Contracted'
+                font_size: '11sp'
+                color: rgba(theme.MUTED)
+            PodLabel:
+                text: root.target_text
+                bold: True
+                font_size: '22sp'
         BoxLayout:
             orientation: 'vertical'
             PodLabel:
                 text: 'Before'
-                font_size: '12sp'
+                font_size: '11sp'
                 color: rgba(theme.MUTED)
             PodLabel:
                 text: root.before_text
                 bold: True
-                font_size: '24sp'
+                font_size: '22sp'
         BoxLayout:
             orientation: 'vertical'
             PodLabel:
                 text: 'After'
-                font_size: '12sp'
+                font_size: '11sp'
                 color: rgba(theme.MUTED)
             PodLabel:
                 text: root.after_text
                 bold: True
-                font_size: '24sp'
+                font_size: '22sp'
         BoxLayout:
             orientation: 'vertical'
             PodLabel:
                 text: 'Consumed'
-                font_size: '12sp'
+                font_size: '11sp'
                 color: rgba(theme.MUTED)
             PodLabel:
                 text: root.used_text
                 bold: True
-                font_size: '24sp'
+                font_size: '22sp'
+                color: rgba(theme.ALERT) if root.over else rgba(theme.INK)
+    PodLabel:
+        text: root.status_text
+        bold: True
+        font_size: '16sp'
+        color: rgba(theme.ALERT) if root.over else rgba(theme.TEAL_DARK)
+
+<LoadingScreen>:
+    canvas.before:
+        Color:
+            rgba: 1, 1, 1, 1
+        Rectangle:
+            pos: self.pos
+            size: self.size
+            source: root.bg_source
+    BoxLayout:
+        orientation: 'vertical'
+        padding: dp(24)
+        spacing: dp(6)
+        Widget:
+        Image:
+            source: root.frame_source
+            size_hint: None, None
+            size: dp(270), dp(304)
+            pos_hint: {'center_x': .5}
+        PodLabel:
+            text: 'THE POD'
+            bold: True
+            font_size: '26sp'
+            halign: 'center'
+            color: rgba('#4A210E')
+        PodLabel:
+            text: root.status_text
+            font_size: '14sp'
+            halign: 'center'
+            color: rgba('#7A4A1E')
+        Widget:
+
+<FolderIcon>:
+    size_hint: None, None
+    size: dp(40), dp(32)
+    pos_hint: {'center_y': .5}
+    canvas:
+        Color:
+            rgba: self.tint
+        # folder: a tab and a body
+        RoundedRectangle:
+            pos: self.x, self.y + dp(22)
+            size: dp(16), dp(10) if self.kind == 'folder' else 0
+            radius: [dp(4), dp(4), 0, 0]
+        RoundedRectangle:
+            pos: self.x, self.y
+            size: (self.width, dp(26)) if self.kind == 'folder' else (0, 0)
+            radius: [dp(5)]
+        # picture: a rounded square with a hill
+        RoundedRectangle:
+            pos: self.x + dp(4), self.y
+            size: (dp(32), dp(32)) if self.kind == 'image' else (0, 0)
+            radius: [dp(6)]
+        Color:
+            rgba: (1, 1, 1, 0.9) if self.kind == 'image' else (0, 0, 0, 0)
+        Triangle:
+            points: self.x + dp(9), self.y + dp(6), self.x + dp(20), self.y + dp(22), self.x + dp(31), self.y + dp(6)
+
+<FolderRow>:
+    size_hint_y: None
+    height: dp(60)
+    padding: dp(16), dp(6), dp(12), dp(6)
+    spacing: dp(16)
+    canvas.before:
+        Color:
+            rgba: rgba(theme.CARD) if self.state == 'normal' else rgba('#E8EAED')
+        Rectangle:
+            pos: self.pos
+            size: self.size
+        Color:
+            rgba: rgba('#E8EAED')
+        Rectangle:
+            pos: self.x + dp(72), self.y
+            size: self.width - dp(72), dp(1)
+    FolderIcon:
+        kind: root.kind
+        tint: rgba('#5F6368') if root.kind == 'folder' else rgba(theme.BLUE_DARK)
+    BoxLayout:
+        orientation: 'vertical'
+        spacing: dp(1)
+        PodLabel:
+            text: root.title
+            font_size: '16sp'
+            color: rgba('#202124')
+            shorten: True
+            shorten_from: 'right'
+            text_size: self.width, None
+        PodLabel:
+            text: root.sub
+            color: rgba('#5F6368')
+            font_size: '12sp'
+
+<PlaceChip>:
+    size_hint: None, None
+    size: dp(112), dp(36)
+    padding: dp(8), 0
+    canvas.before:
+        Color:
+            rgba: rgba(theme.CARD) if self.state == 'normal' else rgba(theme.TEAL_SOFT)
+        RoundedRectangle:
+            pos: self.pos
+            size: self.size
+            radius: [dp(10)]
+        Color:
+            rgba: rgba('#DADCE0')
+        Line:
+            rounded_rectangle: [self.x, self.y, self.width, self.height, dp(10)]
+            width: 1
+    Label:
+        text: root.text
+        font_size: '14sp'
+        color: rgba('#3C4043')
+        shorten: True
+        text_size: self.width, None
+        halign: 'center'
+
+<FolderPicker>:
+    orientation: 'vertical'
+    spacing: 0
+    BoxLayout:
+        id: access_banner
+        size_hint_y: None
+        height: dp(92) if root.need_access else 0
+        opacity: 1 if root.need_access else 0
+        disabled: not root.need_access
+        orientation: 'vertical'
+        padding: dp(12), dp(8)
+        spacing: dp(6)
+        canvas.before:
+            Color:
+                rgba: rgba(theme.ORANGE_SOFT)
+            Rectangle:
+                pos: self.pos
+                size: self.size
+        PodLabel:
+            text: 'To see your folders, allow access to all files, then tap Reload.'
+            color: rgba(theme.ORANGE_DARK)
+            font_size: '12sp'
+        BoxLayout:
+            spacing: dp(8)
+            PodButton:
+                text: 'Allow access'
+                height: dp(34)
+                font_size: '13sp'
+                bg: rgba(theme.ORANGE_DARK)
+                on_release: root.allow_access()
+            PodButton:
+                text: 'Reload'
+                height: dp(34)
+                font_size: '13sp'
+                bg: rgba(theme.CARD)
+                fg: rgba(theme.ORANGE_DARK)
+                on_release: root.reload()
+    ScrollView:
+        size_hint_y: None
+        height: dp(52)
+        do_scroll_y: False
+        do_scroll_x: True
+        BoxLayout:
+            id: places
+            size_hint_x: None
+            width: self.minimum_width
+            spacing: dp(8)
+            padding: dp(16), dp(8)
+    BoxLayout:
+        size_hint_y: None
+        height: dp(44)
+        padding: dp(8), 0, dp(16), 0
+        spacing: dp(4)
+        PodButton:
+            text: '<'
+            size_hint_x: None
+            width: dp(40)
+            height: dp(40)
+            font_size: '18sp'
+            pos_hint: {'center_y': .5}
+            bg: 0, 0, 0, 0
+            fg: rgba('#5F6368')
+            on_release: root.go_up()
+        PodLabel:
+            text: root.crumb
+            font_size: '14sp'
+            color: rgba('#3C4043')
+            shorten: True
+            shorten_from: 'left'
+            text_size: self.width, None
+            pos_hint: {'center_y': .5}
+    Widget:
+        size_hint_y: None
+        height: dp(1)
+        canvas:
+            Color:
+                rgba: rgba('#E8EAED')
+            Rectangle:
+                pos: self.pos
+                size: self.size
+    FloatLayout:
+        ScrollView:
+            size_hint: 1, 1
+            pos_hint: {'x': 0, 'y': 0}
+            BoxLayout:
+                id: rows
+                orientation: 'vertical'
+                size_hint_y: None
+                height: self.minimum_height
+                spacing: 0
+                padding: 0, 0, 0, dp(90)
+        PodLabel:
+            text: root.message
+            color: rgba('#5F6368')
+            font_size: '14sp'
+            halign: 'center'
+            size_hint: 1, None
+            pos_hint: {'x': 0, 'center_y': .55}
+            padding: dp(30), 0
+        PodButton:
+            size_hint: None, None
+            size: (dp(150), dp(52)) if root.allow_new_folder else (0, 0)
+            opacity: 1 if root.allow_new_folder else 0
+            disabled: not root.allow_new_folder
+            pos_hint: {'right': .95, 'y': .03}
+            text: '+  New folder'
+            font_size: '15sp'
+            bg: rgba('#C2E7FF')
+            fg: rgba('#001D35')
+            on_release: root.new_folder()
+
+<DriveSheet>:
+    orientation: 'vertical'
+    canvas.before:
+        Color:
+            rgba: rgba(theme.CARD)
+        Rectangle:
+            pos: self.pos
+            size: self.size
+    BoxLayout:
+        size_hint_y: None
+        height: dp(68)
+        padding: dp(8), dp(8), dp(16), dp(8)
+        spacing: dp(6)
+        PodButton:
+            text: '<'
+            size_hint: None, None
+            size: dp(48), dp(48)
+            font_size: '20sp'
+            pos_hint: {'center_y': .5}
+            bg: 0, 0, 0, 0
+            fg: rgba('#202124')
+            on_release: root.dispatch('on_back')
+        BoxLayout:
+            orientation: 'vertical'
+            PodLabel:
+                text: root.title
+                font_size: '20sp'
+                color: rgba('#202124')
+            PodLabel:
+                text: root.subtitle
+                font_size: '13sp'
+                color: rgba('#5F6368')
+                shorten: True
+                text_size: self.width, None
+    Widget:
+        size_hint_y: None
+        height: dp(1)
+        canvas:
+            Color:
+                rgba: rgba('#E8EAED')
+            Rectangle:
+                pos: self.pos
+                size: self.size
+    BoxLayout:
+        id: body
+        orientation: 'vertical'
+    BoxLayout:
+        id: footer
+        orientation: 'vertical'
+        size_hint_y: None
+        height: self.minimum_height
+        padding: dp(16), dp(10), dp(16), dp(14)
+        spacing: dp(8)
+        canvas.before:
+            Color:
+                rgba: rgba('#E8EAED')
+            Rectangle:
+                pos: self.x, self.top
+                size: self.width, dp(1)
 
 <UnitSpinner>:
     values: UNIT_CHOICES
@@ -271,6 +597,7 @@
             id: name_input
             height: dp(44)
             hint_text: 'Item name'
+            background_color: rgba(theme.PAPER)
         UnitSpinner:
             id: unit_spinner
             size_hint_x: None
@@ -305,12 +632,14 @@
             id: before_input
             height: dp(44)
             hint_text: 'Before'
+            background_color: rgba(theme.PAPER)
             input_filter: 'float'
             input_type: 'number'
         PodInput:
             id: after_input
             height: dp(44)
             hint_text: 'After'
+            background_color: rgba(theme.PAPER)
             input_filter: 'float'
             input_type: 'number'
     PodLabel:
@@ -363,6 +692,14 @@
                 Line:
                     rounded_rectangle: [self.x, self.y, self.width, self.height, dp(14)]
                     width: 1.5
+        PodButton:
+            id: manage_btn
+            text: 'Manage accounts'
+            height: dp(44)
+            font_size: '14sp'
+            bg: rgba(theme.PAPER)
+            fg: rgba(theme.MUTED)
+            on_release: root.toggle_manage()
 
 <CreateAccountScreen>:
     BoxLayout:
@@ -383,7 +720,7 @@
                     bold: True
                     font_size: '13sp'
                     color: rgba(theme.MUTED)
-                PodInput:
+                BorderedInput:
                     id: name_input
                     hint_text: 'Your name'
                 PodLabel:
@@ -422,13 +759,13 @@
                     bold: True
                     font_size: '13sp'
                     color: rgba(theme.MUTED)
-                PodInput:
+                BorderedInput:
                     id: pin_input
                     hint_text: 'PIN'
                     password: True
                     input_filter: 'int'
                     input_type: 'number'
-                PodInput:
+                BorderedInput:
                     id: pin2_input
                     hint_text: 'Type the PIN again'
                     password: True
@@ -459,6 +796,7 @@
                     letter: app.current_user_initial
                     tint: rgba(theme.TEAL_SOFT)
                     ink: rgba(theme.TEAL_DARK)
+                    source: app.current_user_photo
             BoxLayout:
                 orientation: 'vertical'
                 spacing: dp(2)
@@ -519,6 +857,10 @@
             heading: 'Summary history'
             sub: 'Open a date to see its record'
             on_release: app.go('calendar')
+        OptionRow:
+            heading: 'My account'
+            sub: 'Picture, description and PIN'
+            on_release: app.go('account')
         Widget:
 
 <CalendarScreen>:
@@ -649,7 +991,7 @@
                     bold: True
                     font_size: '13sp'
                     color: rgba(theme.MUTED)
-                PodInput:
+                BorderedInput:
                     id: date_input
                     readonly: True
                 PodLabel:
@@ -657,9 +999,19 @@
                     bold: True
                     font_size: '13sp'
                     color: rgba(theme.MUTED)
-                PodInput:
+                BorderedInput:
                     id: loc_input
                     hint_text: 'e.g. Riverside Garden'
+                PodLabel:
+                    text: 'Contracted cups to serve today'
+                    bold: True
+                    font_size: '13sp'
+                    color: rgba(theme.MUTED)
+                BorderedInput:
+                    id: target_input
+                    hint_text: 'e.g. 500'
+                    input_filter: 'int'
+                    input_type: 'number'
                 PodLabel:
                     text: 'Inventory: count before and after the event'
                     bold: True
@@ -694,17 +1046,6 @@
                     fg: rgba(theme.TEAL)
                     on_release: root.add_crew_member()
                 PodLabel:
-                    text: 'Photos of the venue and pack out'
-                    bold: True
-                    font_size: '13sp'
-                    color: rgba(theme.MUTED)
-                PodButton:
-                    text: 'Pick photo (coming in the next step)'
-                    disabled: True
-                    font_size: '14sp'
-                    bg: rgba(theme.LINE)
-                    fg: rgba(theme.MUTED)
-                PodLabel:
                     id: status
                     font_size: '14sp'
                     color: rgba(theme.DANGER)
@@ -732,6 +1073,115 @@
                 PodButton:
                     id: delete_btn
                     text: 'Delete this day'
+                    bg: rgba(theme.ROSE_SOFT)
+                    fg: rgba(theme.ROSE_DARK)
+                    on_release: root.ask_delete()
+
+<AccountScreen>:
+    BoxLayout:
+        orientation: 'vertical'
+        padding: dp(22), dp(22), dp(22), dp(14)
+        spacing: dp(10)
+        TopBar:
+            title: 'My account'
+        ScrollView:
+            BoxLayout:
+                orientation: 'vertical'
+                size_hint_y: None
+                height: self.minimum_height
+                spacing: dp(8)
+                padding: 0, 0, 0, dp(10)
+                AnchorLayout:
+                    size_hint_y: None
+                    height: dp(120)
+                    Avatar:
+                        d: dp(110)
+                        letter: app.current_user_initial
+                        tint: rgba(theme.TEAL_SOFT)
+                        ink: rgba(theme.TEAL_DARK)
+                        source: app.current_user_photo
+                BoxLayout:
+                    size_hint_y: None
+                    height: dp(48)
+                    spacing: dp(8)
+                    PodButton:
+                        text: 'Choose picture'
+                        font_size: '14sp'
+                        bg: rgba(theme.TEAL_SOFT)
+                        fg: rgba(theme.TEAL_DARK)
+                        on_release: root.pick_photo()
+                    PodButton:
+                        id: remove_photo_btn
+                        text: 'Remove picture'
+                        font_size: '14sp'
+                        bg: rgba(theme.ROSE_SOFT)
+                        fg: rgba(theme.ROSE_DARK)
+                        on_release: root.remove_photo()
+                PodLabel:
+                    text: app.current_user_name
+                    bold: True
+                    font_size: '22sp'
+                    halign: 'center'
+                PodLabel:
+                    text: app.current_user_role_text
+                    color: rgba(theme.MUTED)
+                    font_size: '14sp'
+                    halign: 'center'
+                PodLabel:
+                    text: 'Description'
+                    bold: True
+                    font_size: '13sp'
+                    color: rgba(theme.MUTED)
+                BorderedInput:
+                    id: desc_input
+                    hint_text: 'A few words about you'
+                    multiline: True
+                    height: dp(96)
+                PodButton:
+                    text: 'Save description'
+                    bg: rgba(theme.CARD)
+                    fg: rgba(theme.TEAL)
+                    on_release: root.save_description()
+                PodLabel:
+                    id: pin_title
+                    text: 'Change PIN'
+                    bold: True
+                    font_size: '13sp'
+                    color: rgba(theme.MUTED)
+                BorderedInput:
+                    id: old_pin
+                    hint_text: 'Current PIN'
+                    password: True
+                    input_filter: 'int'
+                    input_type: 'number'
+                BorderedInput:
+                    id: new_pin
+                    hint_text: 'New PIN (4 to 6 digits)'
+                    password: True
+                    input_filter: 'int'
+                    input_type: 'number'
+                BorderedInput:
+                    id: new_pin2
+                    hint_text: 'Type the new PIN again'
+                    password: True
+                    input_filter: 'int'
+                    input_type: 'number'
+                PodButton:
+                    text: 'Change PIN'
+                    bg: rgba(theme.CARD)
+                    fg: rgba(theme.TEAL)
+                    on_release: root.change_pin()
+                PodLabel:
+                    id: message
+                    font_size: '14sp'
+                    color: rgba(theme.DANGER)
+                PodLabel:
+                    id: delete_note
+                    color: rgba(theme.MUTED)
+                    font_size: '12sp'
+                PodButton:
+                    id: delete_btn
+                    text: 'Delete my account'
                     bg: rgba(theme.ROSE_SOFT)
                     fg: rgba(theme.ROSE_DARK)
                     on_release: root.ask_delete()

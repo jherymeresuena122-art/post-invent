@@ -2,7 +2,7 @@
 
 # How an item can be counted. Every item is "before the event" minus
 # "after the event" = what was consumed, in the unit you choose.
-UNIT_CHOICES = ["cups", "items", "bags", "grams", "milligrams", "litres"]
+UNIT_CHOICES = ["cups", "items", "bags", "grams", "milligrams", "liters"]
 
 # (name, unit) pairs every NEW event day starts with.
 DEFAULT_ITEMS = [
@@ -11,7 +11,7 @@ DEFAULT_ITEMS = [
     ("Matcha", "bags"),
     ("Beans", "bags"),
     ("Instant coffee", "grams"),
-    ("Milk", "litres"),
+    ("Milk", "liters"),
 ]
 
 
@@ -38,6 +38,17 @@ def fmt(value):
     if value is None:
         return "-"
     return f"{round(value, 3):g}"
+
+
+def cup_status(target, consumed):
+    """Compare the cups used with the cups promised for the day.
+
+    Returns (left_to_serve, over). left_to_serve is None until both numbers are
+    known; over is True when more cups were used than the day's contract allows.
+    """
+    if target is None or consumed is None:
+        return None, False
+    return round(target - consumed, 3), consumed > target
 
 
 def cup_totals(items):
