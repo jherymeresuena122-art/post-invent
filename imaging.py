@@ -14,6 +14,10 @@ def make_avatar(source_path, folder, name, size=AVATAR_SIZE):
     never shows an old cached picture.
     """
     with Image.open(source_path) as img:
+        try:
+            img.draft("RGB", (size * 2, size * 2))   # JPEG: decode a small version, much faster
+        except Exception:
+            pass
         img = ImageOps.exif_transpose(img)          # phone photos are often rotated
         img = ImageOps.fit(img.convert("RGB"), (size, size), Image.LANCZOS)
         os.makedirs(folder, exist_ok=True)

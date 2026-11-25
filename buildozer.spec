@@ -8,7 +8,7 @@ android.presplash_color = #EAB75C
 source.dir = .
 source.include_exts = py,kv,png,jpg,ttf
 source.exclude_patterns = test_database.py,README.md
-version = 1.1
+version = 2.1
 requirements = hostpython3==3.11.5,python3==3.11.5,kivy==2.3.0,pillow,sqlite3
 orientation = portrait
 fullscreen = 0
