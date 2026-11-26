@@ -65,6 +65,7 @@ class FolderPicker(BoxLayout):
             chip = PlaceChip(text=label, full_path=folder)
             chip.bind(on_release=lambda w: self.open_path(w.full_path))
             self.ids.places.add_widget(chip)
+        self.start_path = start
         self.open_path(start)
 
     # ---------------------------------------------------------------- moving
@@ -75,6 +76,10 @@ class FolderPicker(BoxLayout):
 
     def go_up(self):
         self.open_path(folders.parent_of(self.path))
+
+    def can_go_up(self):
+        """True while 'back' should climb to the parent folder instead of closing."""
+        return self.path != self.start_path and folders.parent_of(self.path) != self.path
 
     def reload(self, *_):
         self.need_access = not storage_access.has_all_files_access()

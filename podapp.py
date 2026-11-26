@@ -163,8 +163,11 @@ class DriveSheet(BoxLayout):
         pass
 
 
-def open_sheet(sheet):
-    """Show a DriveSheet over the whole screen. Returns the view (call .dismiss())."""
+def open_sheet(sheet, picker=None):
+    """Show a DriveSheet over the whole screen. Returns the view (call .dismiss()).
+
+    With a folder picker, the back arrow first climbs to the parent folder (like a
+    cloud-drive app) and only closes the sheet when there is nowhere higher to go."""
     view = ModalView(
         size_hint=(1, 1),
         auto_dismiss=False,
@@ -173,7 +176,16 @@ def open_sheet(sheet):
         overlay_color=(0, 0, 0, 0),
     )
     view.add_widget(sheet)
-    sheet.bind(on_back=lambda *_: view.dismiss())
+
+    def _back(*_):
+        if picker is not None and picker.can_go_up():
+            picker.go_up()
+        else:
+            view.dismiss()
+        return True
+
+    sheet.bind(on_back=_back)
+    view.sheet = sheet
     view.open()
     return view
 
@@ -353,7 +365,7 @@ def export_popup(app, data, base_name):
         picker.reload()
 
     save.bind(on_release=_export)
-    open_sheet(sheet)
+    open_sheet(sheet, picker)
 
 
 def photo_popup(app, on_chosen):
@@ -383,7 +395,7 @@ def photo_popup(app, on_chosen):
     sheet.subtitle = folder_name_of(picker.path)
     picker.bind(path=lambda w, value: setattr(sheet, "subtitle", folder_name_of(value)))
     sheet.ids.body.add_widget(picker)
-    holder["view"] = open_sheet(sheet)
+    holder["view"] = open_sheet(sheet, picker)
 
 
 APP_VERSION = "2.1"
@@ -416,7 +428,7 @@ def backup_file_popup(app, on_chosen):
     sheet.subtitle = folder_name_of(picker.path)
     picker.bind(path=lambda w, value: setattr(sheet, "subtitle", folder_name_of(value)))
     sheet.ids.body.add_widget(picker)
-    holder["view"] = open_sheet(sheet)
+    holder["view"] = open_sheet(sheet, picker)
 
 
 def start_restore(app):
@@ -464,6 +476,8 @@ def start_restore(app):
 
     def chosen(path):
         if not path:
+            if android_media.last_error:
+                notice("Could not open", android_media.last_error, 300)
             return
         try:
             info = backup.peek(path)
@@ -763,19 +777,23 @@ class AccountScreen(PodScreen):
         if not android_media.IS_ANDROID:
             self._say("The camera works on the phone. On a PC use 'From gallery'.")
             return
-        android_media.take_photo(self._got_photo, cache_folder(app))
+        if not android_media.take_photo(self._got_photo, cache_folder(app)):
+            self._say(f"The camera could not open. {android_media.last_error}")
 
     def pick_photo(self):
         """'From gallery': the phone's gallery, or the file browser on a PC."""
         app = App.get_running_app()
         if android_media.IS_ANDROID:
-            android_media.pick_from_gallery(self._got_photo, cache_folder(app))
+            if not android_media.pick_from_gallery(self._got_photo, cache_folder(app)):
+                self._say(f"The gallery could not open. {android_media.last_error}")
         else:
             photo_popup(app, self._use_photo)
 
     def _got_photo(self, path):
-        if path:                       # None = the person cancelled
+        if path:                       # None = the person cancelled (or it failed)
             self._use_photo(path)
+        elif android_media.last_error:
+            self._say(f"Could not get the picture. {android_media.last_error}")
 
     def _use_photo(self, path):
         app = App.get_running_app()
@@ -823,7 +841,7 @@ class AccountScreen(PodScreen):
             if ok:
                 self._say(f"Backup saved ({text}). Keep the file safe: it has your PINs.", good=True)
             else:
-                self._say("The backup was not saved.")
+                self._say("The backup was not saved. " + android_media.last_error)
 
         if android_media.IS_ANDROID:
             android_media.save_file_dialog(temp, name, done)
@@ -1558,6 +1576,7 @@ class PodInventoryApp(App):
         self.title = "The Pod Inventory"
         self._ensure_kv()
         manager = ScreenManager(transition=SlideTransition(duration=0.18))
+        Window.bind(on_keyboard=self._on_key)
         self.loading = LoadingScreen(name="loading")
         manager.add_widget(self.loading)          # the first screen: the filling cup
         self._boot_steps = [
@@ -1573,6 +1592,61 @@ class PodInventoryApp(App):
         self._boot_progress = 0.0
         Clock.schedule_once(self._boot_tick, 0.3)
         return manager
+
+    # ------------------------------------------------------------- phone Back button
+    BACK_TARGET = {"create_account": "choose", "account": "home", "calendar": "home", "create_day": "home"}
+
+    def _on_key(self, window, key, *args):
+        """The phone's Back button (key 27). Close the top box, or go one screen back.
+        On the sign-in and home screens it asks to press twice, so a slip never exits."""
+        if key != 27:
+            return False
+        # 1. the top-most open box (sheet, popup, spinner list)
+        for child in reversed(window.children):
+            if isinstance(child, ModalView) and getattr(child, "_is_open", False):
+                sheet = getattr(child, "sheet", None)
+                if sheet is not None:
+                    sheet.dispatch("on_back")
+                else:
+                    child.dismiss()
+                return True
+        current = self.root.current if self.root else ""
+        if current == "loading":
+            return True
+        # 2. a normal screen goes back to where its "<" arrow goes
+        if current in self.BACK_TARGET:
+            self.go(self.BACK_TARGET[current], "right")
+            return True
+        # 3. home and sign-in: press twice
+        now = Clock.get_time()
+        if now - getattr(self, "_last_back", -10) < 2.0:
+            if current == "home":
+                self.logout()
+                return True
+            self.stop()
+            return True
+        self._last_back = now
+        self.show_hint("Press back again to sign out" if current == "home" else "Press back again to exit")
+        return True
+
+    def show_hint(self, text):
+        """A small message at the bottom of the screen for two seconds."""
+        old = getattr(self, "_hint", None)
+        if old is not None and old.parent is not None:
+            old.parent.remove_widget(old)
+        hint = Label(
+            text=text, size_hint=(None, None), size=(dp(260), dp(40)),
+            pos=((Window.width - dp(260)) / 2, dp(90)), color=(1, 1, 1, 1),
+        )
+        with hint.canvas.before:
+            from kivy.graphics import Color, RoundedRectangle
+            Color(0.23, 0.11, 0.05, 0.92)
+            RoundedRectangle(pos=hint.pos, size=hint.size, radius=[dp(20)])
+        Window.add_widget(hint)
+        self._hint = hint
+        Clock.schedule_once(
+            lambda dt: hint.parent.remove_widget(hint) if hint.parent else None, 2.0
+        )
 
     def on_pause(self):
         """Stay alive while the person visits Android settings (for file access)."""

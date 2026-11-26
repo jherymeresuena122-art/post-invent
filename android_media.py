@@ -20,6 +20,19 @@ IS_ANDROID = platform == "android"
 _GALLERY, _CAMERA, _SAVE, _OPEN = 7101, 7102, 7103, 7104
 _RESULT_OK = -1
 _pending = {}          # request code -> handler
+last_error = ""        # why the last call failed (shown to the person instead of crashing)
+
+
+def _reset():
+    global last_error
+    last_error = ""
+
+
+def _fail(err, callback, value=None):
+    global last_error
+    last_error = f"{type(err).__name__}: {err}"[:300]
+    callback(value)
+    return False
 
 
 def _activity():
@@ -71,22 +84,27 @@ def pick_from_gallery(callback, cache_dir):
     if not IS_ANDROID:
         callback(None)
         return False
-    from jnius import autoclass
-    Intent = autoclass("android.content.Intent")
+    _reset()
+    try:
+        from jnius import autoclass
+        Intent = autoclass("android.content.Intent")
 
-    def done(result_code, intent):
-        if result_code != _RESULT_OK or intent is None or intent.getData() is None:
-            return callback(None)
-        try:
-            callback(_copy_from_uri(intent.getData(), _temp_path(cache_dir, ".jpg")))
-        except Exception:
-            callback(None)
+        def done(result_code, intent):
+            if result_code != _RESULT_OK or intent is None or intent.getData() is None:
+                return callback(None)
+            try:
+                callback(_copy_from_uri(intent.getData(), _temp_path(cache_dir, ".jpg")))
+            except Exception as err:
+                _fail(err, callback)
 
-    intent = Intent(Intent.ACTION_GET_CONTENT)
-    intent.setType("image/*")
-    intent.addCategory(Intent.CATEGORY_OPENABLE)
-    _start(Intent.createChooser(intent, "Choose a picture"), _GALLERY, done)
-    return True
+        # ACTION_GET_CONTENT already shows Android's own chooser, so no createChooser
+        intent = Intent(Intent.ACTION_GET_CONTENT)
+        intent.setType("image/*")
+        intent.addCategory(Intent.CATEGORY_OPENABLE)
+        _start(intent, _GALLERY, done)
+        return True
+    except Exception as err:
+        return _fail(err, callback)
 
 
 def take_photo(callback, cache_dir):
@@ -94,40 +112,48 @@ def take_photo(callback, cache_dir):
     if not IS_ANDROID:
         callback(None)
         return False
-    from jnius import autoclass
-    Intent = autoclass("android.content.Intent")
-    MediaStore = autoclass("android.provider.MediaStore")
-    Images = autoclass("android.provider.MediaStore$Images$Media")
-    ContentValues = autoclass("android.content.ContentValues")
+    _reset()
+    try:
+        from jnius import autoclass, cast
+        Intent = autoclass("android.content.Intent")
+        MediaStore = autoclass("android.provider.MediaStore")
+        Images = autoclass("android.provider.MediaStore$Images$Media")
+        ContentValues = autoclass("android.content.ContentValues")
 
-    resolver = _activity().getContentResolver()
-    values = ContentValues()
-    values.put("_display_name", f"pod_profile_{int(time.time())}.jpg")
-    values.put("mime_type", "image/jpeg")
-    values.put("relative_path", "Pictures/ThePod")      # ignored by phones older than Android 10
-    uri = resolver.insert(Images.EXTERNAL_CONTENT_URI, values)
-    if uri is None:
-        callback(None)
-        return False
+        resolver = _activity().getContentResolver()
+        values = ContentValues()
+        values.put("_display_name", f"pod_profile_{int(time.time())}.jpg")
+        values.put("mime_type", "image/jpeg")
+        values.put("relative_path", "Pictures/ThePod")   # ignored by phones older than Android 10
+        uri = resolver.insert(Images.EXTERNAL_CONTENT_URI, values)
+        if uri is None:
+            raise RuntimeError("the phone would not make a place for the photo")
 
-    def done(result_code, intent):
-        path = None
-        try:
-            if result_code == _RESULT_OK:
-                path = _copy_from_uri(uri, _temp_path(cache_dir, ".jpg"))
-        except Exception:
+        def done(result_code, intent):
             path = None
-        try:
-            resolver.delete(uri, None, None)    # do not leave a second copy in the gallery
-        except Exception:
-            pass
-        callback(path)
+            error = None
+            try:
+                if result_code == _RESULT_OK:
+                    path = _copy_from_uri(uri, _temp_path(cache_dir, ".jpg"))
+            except Exception as err:
+                error = err
+            try:
+                resolver.delete(uri, None, None)    # do not leave a second copy in the gallery
+            except Exception:
+                pass
+            if error is not None:
+                _fail(error, callback)
+            else:
+                callback(path)
 
-    intent = Intent(MediaStore.ACTION_IMAGE_CAPTURE)
-    intent.putExtra(MediaStore.EXTRA_OUTPUT, uri)
-    intent.addFlags(Intent.FLAG_GRANT_WRITE_URI_PERMISSION | Intent.FLAG_GRANT_READ_URI_PERMISSION)
-    _start(intent, _CAMERA, done)
-    return True
+        intent = Intent(MediaStore.ACTION_IMAGE_CAPTURE)
+        # the Uri must be passed as a Parcelable, or Android sees it as a String
+        intent.putExtra(MediaStore.EXTRA_OUTPUT, cast("android.os.Parcelable", uri))
+        intent.addFlags(Intent.FLAG_GRANT_WRITE_URI_PERMISSION | Intent.FLAG_GRANT_READ_URI_PERMISSION)
+        _start(intent, _CAMERA, done)
+        return True
+    except Exception as err:
+        return _fail(err, callback)
 
 
 # ------------------------------------------------------------ backup files
@@ -137,24 +163,28 @@ def save_file_dialog(source_path, suggested_name, callback):
     if not IS_ANDROID:
         callback(False)
         return False
-    from jnius import autoclass
-    Intent = autoclass("android.content.Intent")
+    _reset()
+    try:
+        from jnius import autoclass
+        Intent = autoclass("android.content.Intent")
 
-    def done(result_code, intent):
-        if result_code != _RESULT_OK or intent is None or intent.getData() is None:
-            return callback(False)
-        try:
-            _copy_to_uri(source_path, intent.getData())
-            callback(True)
-        except Exception:
-            callback(False)
+        def done(result_code, intent):
+            if result_code != _RESULT_OK or intent is None or intent.getData() is None:
+                return callback(False)
+            try:
+                _copy_to_uri(source_path, intent.getData())
+                callback(True)
+            except Exception as err:
+                _fail(err, callback, False)
 
-    intent = Intent(Intent.ACTION_CREATE_DOCUMENT)
-    intent.addCategory(Intent.CATEGORY_OPENABLE)
-    intent.setType("application/octet-stream")
-    intent.putExtra(Intent.EXTRA_TITLE, suggested_name)
-    _start(intent, _SAVE, done)
-    return True
+        intent = Intent(Intent.ACTION_CREATE_DOCUMENT)
+        intent.addCategory(Intent.CATEGORY_OPENABLE)
+        intent.setType("application/octet-stream")
+        intent.putExtra(Intent.EXTRA_TITLE, suggested_name)
+        _start(intent, _SAVE, done)
+        return True
+    except Exception as err:
+        return _fail(err, callback, False)
 
 
 def open_file_dialog(callback, cache_dir):
@@ -162,22 +192,26 @@ def open_file_dialog(callback, cache_dir):
     if not IS_ANDROID:
         callback(None)
         return False
-    from jnius import autoclass
-    Intent = autoclass("android.content.Intent")
+    _reset()
+    try:
+        from jnius import autoclass
+        Intent = autoclass("android.content.Intent")
 
-    def done(result_code, intent):
-        if result_code != _RESULT_OK or intent is None or intent.getData() is None:
-            return callback(None)
-        try:
-            callback(_copy_from_uri(intent.getData(), _temp_path(cache_dir, ".podbackup")))
-        except Exception:
-            callback(None)
+        def done(result_code, intent):
+            if result_code != _RESULT_OK or intent is None or intent.getData() is None:
+                return callback(None)
+            try:
+                callback(_copy_from_uri(intent.getData(), _temp_path(cache_dir, ".podbackup")))
+            except Exception as err:
+                _fail(err, callback)
 
-    intent = Intent(Intent.ACTION_GET_CONTENT)
-    intent.setType("*/*")
-    intent.addCategory(Intent.CATEGORY_OPENABLE)
-    _start(Intent.createChooser(intent, "Choose your Pod backup"), _OPEN, done)
-    return True
+        intent = Intent(Intent.ACTION_GET_CONTENT)
+        intent.setType("*/*")
+        intent.addCategory(Intent.CATEGORY_OPENABLE)
+        _start(intent, _OPEN, done)
+        return True
+    except Exception as err:
+        return _fail(err, callback)
 
 
 def clean_cache(cache_dir):
