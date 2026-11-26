@@ -2,6 +2,7 @@
 import os
 
 IMAGE_EXTS = (".jpg", ".jpeg", ".png", ".webp", ".bmp")
+BACKUP_EXTS = (".podbackup",)
 BAD_NAME_CHARS = '\\/:*?"<>|'
 
 

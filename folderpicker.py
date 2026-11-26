@@ -35,6 +35,9 @@ class PlaceChip(ButtonBehavior, BoxLayout):
     full_path = StringProperty("")
 
 
+PAGE = 40          # rows added at a time, so a folder with thousands of photos stays fast
+
+
 def _when(stamp):
     return time.strftime("%b %d, %Y", time.localtime(stamp))
 
@@ -47,18 +50,22 @@ class FolderPicker(BoxLayout):
     show_files = BooleanProperty(False)
     crumb = StringProperty("")
 
-    def __init__(self, start, ask_text, on_file=None, show_files=False, places=(), **kwargs):
+    def __init__(self, start, ask_text, on_file=None, show_files=False, places=(), exts=None, **kwargs):
+        self._entries = []
+        self._shown = 0
+        self._more_row = None
         super().__init__(**kwargs)
         self.ask_text = ask_text            # function(title, hint, ok_text, on_ok)
         self.on_file = on_file
         self.show_files = show_files
         self.allow_new_folder = not show_files
-        self.exts = folders.IMAGE_EXTS if show_files else None
+        self.exts = (exts or folders.IMAGE_EXTS) if show_files else None
 
         for label, folder in folders.shortcut_list(places):
             chip = PlaceChip(text=label, full_path=folder)
             chip.bind(on_release=lambda w: self.open_path(w.full_path))
             self.ids.places.add_widget(chip)
+        self.start_path = start
         self.open_path(start)
 
     # ---------------------------------------------------------------- moving
@@ -70,10 +77,16 @@ class FolderPicker(BoxLayout):
     def go_up(self):
         self.open_path(folders.parent_of(self.path))
 
+    def can_go_up(self):
+        """True while 'back' should climb to the parent folder instead of closing."""
+        return self.path != self.start_path and folders.parent_of(self.path) != self.path
+
     def reload(self, *_):
         self.need_access = not storage_access.has_all_files_access()
         box = self.ids.rows
         box.clear_widgets()
+        self._more_row = None
+        self._entries, self._shown = [], 0
         self.message = ""
         try:
             dirs, files = folders.list_entries(self.path, self.exts)
@@ -83,15 +96,33 @@ class FolderPicker(BoxLayout):
                 "or pick another folder."
             )
             return
-        for name, full in dirs:
-            box.add_widget(self._row(name, "Folder", "folder", full))
-        for name, full, stamp in files:
-            box.add_widget(self._row(name, _when(stamp), "image", full))
-        if not dirs and not files:
+        self._entries = (
+            [(name, "Folder", "folder", full) for name, full in dirs]
+            + [(name, _when(stamp), "image", full) for name, full, stamp in files]
+        )
+        if not self._entries:
             self.message = (
-                "No pictures or folders here." if self.show_files
+                "No matching files or folders here." if self.show_files
                 else "This folder is empty. Tap New folder to make one."
             )
+            return
+        self.show_more()
+
+    def show_more(self, *_):
+        """Add the next page of rows (newest pictures come first)."""
+        box = self.ids.rows
+        if self._more_row is not None:
+            box.remove_widget(self._more_row)
+            self._more_row = None
+        chunk = self._entries[self._shown:self._shown + PAGE]
+        for name, sub, kind, full in chunk:
+            box.add_widget(self._row(name, sub, kind, full))
+        self._shown += len(chunk)
+        left = len(self._entries) - self._shown
+        if left > 0:
+            self._more_row = FolderRow(title=f"Show more ({left} left)", kind="more")
+            self._more_row.bind(on_release=self.show_more)
+            box.add_widget(self._more_row)
 
     def _row(self, title, sub, kind, full):
         row = FolderRow(title=title, sub=sub, kind=kind, full_path=full)

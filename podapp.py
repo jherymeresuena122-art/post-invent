@@ -6,6 +6,7 @@ Rules about who may do what live in permissions.py; the look is in podinventory.
 """
 import calendar
 import os
+import shutil
 from datetime import date, datetime
 
 from kivy.app import App
@@ -34,10 +35,13 @@ from kivy.uix.togglebutton import ToggleButton
 from kivy.uix.widget import Widget
 from kivy.utils import escape_markup, platform
 
+import android_media
+import backup
 import storage_access
 import theme
 from database import Database, EventLockedError
 from folderpicker import FolderPicker
+from folders import BACKUP_EXTS
 from imaging import make_avatar, remove_file
 from permissions import (
     ADMIN,
@@ -86,6 +90,7 @@ class RoleToggle(ToggleButton):
 class TopBar(BoxLayout):
     title = StringProperty("")
     back_to = StringProperty("home")  # which screen the "<" button returns to
+    show_view = BooleanProperty(True)  # show "Viewing <name>" (admin looking at another account)
 
 
 class OptionRow(ButtonBehavior, BoxLayout):
@@ -158,8 +163,11 @@ class DriveSheet(BoxLayout):
         pass
 
 
-def open_sheet(sheet):
-    """Show a DriveSheet over the whole screen. Returns the view (call .dismiss())."""
+def open_sheet(sheet, picker=None):
+    """Show a DriveSheet over the whole screen. Returns the view (call .dismiss()).
+
+    With a folder picker, the back arrow first climbs to the parent folder (like a
+    cloud-drive app) and only closes the sheet when there is nowhere higher to go."""
     view = ModalView(
         size_hint=(1, 1),
         auto_dismiss=False,
@@ -168,7 +176,16 @@ def open_sheet(sheet):
         overlay_color=(0, 0, 0, 0),
     )
     view.add_widget(sheet)
-    sheet.bind(on_back=lambda *_: view.dismiss())
+
+    def _back(*_):
+        if picker is not None and picker.can_go_up():
+            picker.go_up()
+        else:
+            view.dismiss()
+        return True
+
+    sheet.bind(on_back=_back)
+    view.sheet = sheet
     view.open()
     return view
 
@@ -343,12 +360,12 @@ def export_popup(app, data, base_name):
             message.color = theme.rgba(theme.DANGER)
             message.text = f"Could not save: {err}"
             return
-        message.color = theme.rgba(theme.TEAL_DARK)
+        message.color = theme.rgba(theme.GREEN_DARK)
         message.text = f"Saved: {os.path.basename(path)}"
         picker.reload()
 
     save.bind(on_release=_export)
-    open_sheet(sheet)
+    open_sheet(sheet, picker)
 
 
 def photo_popup(app, on_chosen):
@@ -378,7 +395,132 @@ def photo_popup(app, on_chosen):
     sheet.subtitle = folder_name_of(picker.path)
     picker.bind(path=lambda w, value: setattr(sheet, "subtitle", folder_name_of(value)))
     sheet.ids.body.add_widget(picker)
-    holder["view"] = open_sheet(sheet)
+    holder["view"] = open_sheet(sheet, picker)
+
+
+APP_VERSION = "2.1"
+
+
+def cache_folder(app):
+    folder = os.path.join(app.user_data_dir, "cache")
+    os.makedirs(folder, exist_ok=True)
+    return folder
+
+
+def notice(title, message, height=280):
+    confirm_popup(title, message, "OK", lambda: None, height)
+
+
+def backup_file_popup(app, on_chosen):
+    """PC only: browse for a .podbackup file (the phone uses Android's own screen)."""
+    sheet = DriveSheet(title="Choose your backup")
+    holder = {}
+
+    def _picked(path):
+        holder["view"].dismiss()
+        on_chosen(path)
+
+    start = default_export_folder(app)
+    picker = FolderPicker(
+        start, input_popup, on_file=_picked, show_files=True,
+        places=quick_places(app), exts=BACKUP_EXTS,
+    )
+    sheet.subtitle = folder_name_of(picker.path)
+    picker.bind(path=lambda w, value: setattr(sheet, "subtitle", folder_name_of(value)))
+    sheet.ids.body.add_widget(picker)
+    holder["view"] = open_sheet(sheet, picker)
+
+
+def start_restore(app):
+    """Pick a backup file, show what is in it, then replace everything with it.
+
+    On a phone that already has accounts the Creator admin's PIN is needed first.
+    A fresh install (no accounts) can restore straight away.
+    """
+    cache = cache_folder(app)
+
+    def finished(info):
+        app.logout()
+        try:
+            app.root.get_screen("choose").refresh()
+        except Exception:
+            pass
+        if info.get("scope") == "account":
+            kept = (
+                f" {info['skipped']} days were already there and kept as they are." if info["skipped"] else ""
+            )
+            made = "The account was created. " if info["created"] else "The account already existed. "
+            notice(
+                f"{info['name']} restored",
+                f"{made}{info['added']} work days added.{kept}\n"
+                "Choose the profile and sign in with the usual PIN.",
+                340,
+            )
+            return
+        notice(
+            "Backup restored",
+            f"{info['accounts']} accounts and {info['days']} work days are back.\n"
+            "Choose your profile and sign in with your usual PIN.",
+            300,
+        )
+
+    def do_restore(path):
+        try:
+            info = backup.restore_any(app.db, path, os.path.join(app.user_data_dir, "avatars"))
+        except backup.BackupError as err:
+            remove_file(path)
+            notice("Could not restore", str(err), 300)
+            return
+        remove_file(path)
+        finished(info)
+
+    def chosen(path):
+        if not path:
+            if android_media.last_error:
+                notice("Could not open", android_media.last_error, 300)
+            return
+        try:
+            info = backup.peek(path)
+        except backup.BackupError as err:
+            remove_file(path)
+            notice("Could not open", str(err), 280)
+            return
+        made = (info["created_at"] or "unknown date").replace("T", " ")
+        if info["scope"] == "account":
+            body = (
+                f"Account {info['name']}: {info['days']} work days, saved {made}.\n\n"
+                "It is added to the app. Nothing else is changed."
+            )
+        else:
+            body = (
+                f"{info['accounts']} accounts and {info['days']} work days, saved {made}.\n\n"
+                "Everything now in the app will be replaced."
+            )
+        confirm_popup(
+            "Restore this backup?", body, "Yes, restore", lambda: do_restore(path), 340,
+        )
+
+    def pick():
+        if android_media.IS_ANDROID:
+            android_media.open_file_dialog(chosen, cache)
+        else:
+            backup_file_popup(app, chosen)
+
+    users = app.db.list_users()
+    admin = next((u for u in users if u["role"] == ADMIN), None)
+    if admin is not None and admin["pin_hash"]:
+        def check(pin):
+            if app.db.verify_pin(admin["id"], pin):
+                Clock.schedule_once(lambda dt: pick(), 0.2)
+                return ""
+            return "Wrong PIN."
+
+        input_popup(
+            f"Creator admin PIN ({admin['name']})", "PIN", "Continue", check,
+            password=True, digits_only=True, max_length=6,
+        )
+    else:
+        pick()
 
 
 # -------------------------------------------------------------------- screens
@@ -449,6 +591,9 @@ class ChooseUserScreen(PodScreen):
         if user is not None:
             remove_file(user["photo_path"])
         self.refresh()
+
+    def restore(self):
+        start_restore(App.get_running_app())
 
     def toggle_manage(self):
         app = App.get_running_app()
@@ -542,8 +687,60 @@ class CreateAccountScreen(PodScreen):
 
 
 class HomeScreen(PodScreen):
+    drawer_open = BooleanProperty(False)
+
     def on_pre_enter(self, *args):
-        App.get_running_app().refresh_totals()
+        app = App.get_running_app()
+        app.refresh_totals()
+        self.drawer_open = False
+        self.refresh_accounts()
+
+    def toggle_accounts(self):
+        self.drawer_open = not self.drawer_open
+        self.refresh_accounts()
+
+    def refresh_accounts(self):
+        """Creator admin only: a drawer listing every registered account.
+        Tapping one shows that account's days; 'Back to mine' returns."""
+        app = App.get_running_app()
+        ids = self.ids
+        is_admin = app.current_user_role == ADMIN
+        set_visible(ids.accounts_btn, is_admin, dp(44))
+        ids.accounts_btn.text = "Registered accounts  ^" if self.drawer_open else "Registered accounts  v"
+        set_visible(ids.view_bar, app.viewing_other, dp(44))
+        box = ids.accounts_box
+        box.clear_widgets()
+        if is_admin and self.drawer_open:
+            for user in app.db.list_users():
+                mine = user["id"] == app.current_user_id
+                shown = user["id"] == app.view_user_id
+                count = app.db.count_events(user["id"])
+                row = PodButton(
+                    text=f"{user['name']}{' (me)' if mine else ''}  -  {role_label(user['role'])}  -  {count} days",
+                    font_size="14sp",
+                    height=dp(46),
+                    bg=theme.rgba(theme.TEAL if shown else theme.CARD),
+                    fg=[1, 1, 1, 1] if shown else theme.rgba(theme.INK),
+                )
+                row.bind(on_release=lambda w, uid=user["id"]: self.pick_account(uid))
+                box.add_widget(row)
+            height = min(dp(230), len(box.children) * dp(52))
+        else:
+            height = 0
+        ids.accounts_scroll.height = height
+        ids.accounts_scroll.opacity = 1 if height else 0
+        ids.accounts_scroll.disabled = not height
+
+    def pick_account(self, user_id):
+        app = App.get_running_app()
+        app.set_view(user_id, go_home=False)
+        self.drawer_open = False
+        self.refresh_accounts()
+
+    def back_to_mine(self):
+        app = App.get_running_app()
+        app.set_view(app.current_user_id, go_home=False)
+        self.refresh_accounts()
 
 
 class AccountScreen(PodScreen):
@@ -563,6 +760,7 @@ class AccountScreen(PodScreen):
         ids.pin_title.text = "Change PIN" if has_pin else "Set a PIN (optional)"
         is_admin = app.current_user_role == ADMIN
         set_visible(ids.delete_btn, not is_admin, dp(52))
+        set_visible(ids.admin_backup_box, is_admin, dp(100))
         ids.delete_note.text = (
             "The Creator admin account can't be deleted." if is_admin else
             "Deleting your account keeps the days you worked, with your name on them."
@@ -570,13 +768,32 @@ class AccountScreen(PodScreen):
         ids.remove_photo_btn.disabled = not app.current_user_photo
 
     def _say(self, text, good=False):
-        self.ids.message.color = theme.rgba(theme.TEAL_DARK if good else theme.DANGER)
+        self.ids.message.color = theme.rgba(theme.GREEN_DARK if good else theme.DANGER)
         self.ids.message.text = text
 
     # ----- picture
-    def pick_photo(self):
+    def take_photo(self):
         app = App.get_running_app()
-        photo_popup(app, self._use_photo)
+        if not android_media.IS_ANDROID:
+            self._say("The camera works on the phone. On a PC use 'From gallery'.")
+            return
+        if not android_media.take_photo(self._got_photo, cache_folder(app)):
+            self._say(f"The camera could not open. {android_media.last_error}")
+
+    def pick_photo(self):
+        """'From gallery': the phone's gallery, or the file browser on a PC."""
+        app = App.get_running_app()
+        if android_media.IS_ANDROID:
+            if not android_media.pick_from_gallery(self._got_photo, cache_folder(app)):
+                self._say(f"The gallery could not open. {android_media.last_error}")
+        else:
+            photo_popup(app, self._use_photo)
+
+    def _got_photo(self, path):
+        if path:                       # None = the person cancelled (or it failed)
+            self._use_photo(path)
+        elif android_media.last_error:
+            self._say(f"Could not get the picture. {android_media.last_error}")
 
     def _use_photo(self, path):
         app = App.get_running_app()
@@ -587,12 +804,58 @@ class AccountScreen(PodScreen):
         except Exception as err:
             self._say(f"Could not use that picture: {err}")
             return
+        finally:
+            android_media.clean_cache(cache_folder(app))
         if user is not None:
             remove_file(user["photo_path"])
         app.db.set_photo(app.current_user_id, new_path)
         app.current_user_photo = new_path
         self.ids.remove_photo_btn.disabled = False
         self._say("Picture saved.", good=True)
+
+    # ----- backup (Creator admin only)
+    def save_backup(self):
+        """Creator admin: everything (all accounts)."""
+        self._save(None)
+
+    def save_my_backup(self):
+        """Any account: only my own profile and days."""
+        self._save(App.get_running_app().current_user_id)
+
+    def _save(self, user_id):
+        app = App.get_running_app()
+        name = backup.suggested_name(who=app.current_user_name if user_id else None)
+        temp = os.path.join(cache_folder(app), "incoming_" + name)
+        try:
+            summary = backup.make_backup(app.db, temp, APP_VERSION, user_id=user_id)
+        except Exception as err:
+            self._say(f"Could not make the backup: {err}")
+            return
+        text = (
+            f"{summary['days']} work days" if user_id
+            else f"{summary['accounts']} accounts and {summary['days']} work days"
+        )
+
+        def done(ok):
+            remove_file(temp)
+            if ok:
+                self._say(f"Backup saved ({text}). Keep the file safe: it has your PINs.", good=True)
+            else:
+                self._say("The backup was not saved. " + android_media.last_error)
+
+        if android_media.IS_ANDROID:
+            android_media.save_file_dialog(temp, name, done)
+        else:
+            try:
+                target = os.path.join(default_export_folder(app), name)
+                shutil.copyfile(temp, target)
+                remove_file(temp)
+                self._say(f"Backup saved to {target}", good=True)
+            except OSError as err:
+                self._say(f"Could not save: {err}")
+
+    def restore_backup(self):
+        start_restore(App.get_running_app())
 
     def remove_photo(self):
         app = App.get_running_app()
@@ -702,8 +965,8 @@ class CalendarScreen(PodScreen):
         app = App.get_running_app()
         ids = self.ids
         ids.month_title.text = f"{calendar.month_name[self.month]} {self.year}"
-        status = app.db.month_status(self.year, self.month)
-        booked = app.db.month_bookings(self.year, self.month)
+        status = app.db.month_status(self.year, self.month, app.view_user_id)
+        booked = app.db.month_bookings(self.year, self.month, app.view_user_id)
         weeks = calendar.Calendar(firstweekday=6).monthdayscalendar(self.year, self.month)
 
         ids.days.clear_widgets()
@@ -718,7 +981,7 @@ class CalendarScreen(PodScreen):
                 if date_str == self.selected:
                     bg, fg = theme.rgba(theme.TEAL), [1, 1, 1, 1]
                 elif state == "submitted":
-                    bg, fg = theme.rgba(theme.TEAL_SOFT), theme.rgba(theme.TEAL_DARK)
+                    bg, fg = theme.rgba(theme.GREEN_SOFT), theme.rgba(theme.GREEN_DARK)
                 elif state == "draft":
                     bg, fg = theme.rgba(theme.ORANGE_SOFT), theme.rgba(theme.ORANGE_DARK)
                 elif date_str in booked:
@@ -743,8 +1006,8 @@ class CalendarScreen(PodScreen):
             return
 
         nice = datetime.strptime(self.selected, "%Y-%m-%d").strftime("%A, %B %d, %Y")
-        event = app.db.get_event(self.selected)
-        booked = app.db.has_booking(self.selected)
+        event = app.db.get_event(self.selected, app.view_user_id)
+        booked = app.db.has_booking(self.selected, app.view_user_id)
 
         if event is not None:
             lines = [f"[b]{nice}[/b]", f"Location: {escape_markup(event['location'])}"]
@@ -823,11 +1086,11 @@ class CalendarScreen(PodScreen):
 
     def toggle_booking(self):
         app = App.get_running_app()
-        if app.db.has_booking(self.selected):
-            app.db.remove_booking(self.selected)
+        if app.db.has_booking(self.selected, app.view_user_id):
+            app.db.remove_booking(self.selected, app.view_user_id)
         else:
             try:
-                app.db.add_booking(self.selected, app.current_user_id)
+                app.db.add_booking(self.selected, app.view_user_id)
             except ValueError:
                 pass
         app.refresh_totals()
@@ -999,7 +1262,7 @@ class CreateDayScreen(PodScreen):
         ids = self.ids
         role = app.current_user_role
         today = date.today().isoformat()
-        event = app.db.get_event(date_str)
+        event = app.db.get_event(date_str, app.view_user_id)
 
         self.event_id = event["id"] if event else 0
         self.submitted = bool(event and event["submitted_at"])
@@ -1007,7 +1270,7 @@ class CreateDayScreen(PodScreen):
         self.editable = (not self.submitted) and can_start_day(role, date_str, today)
 
         items, crew_names = [], []
-        team_ids = {app.current_user_id} if date_str == today else set()
+        team_ids = {app.view_user_id} if date_str == today else set()
         if event is not None:
             items = app.db.get_items(event["id"])
             team_ids = {u["id"] for u in app.db.get_team(event["id"])}
@@ -1126,7 +1389,7 @@ class CreateDayScreen(PodScreen):
         return date_str, location, items, team_ids, crew_names, warnings
 
     def _say(self, text, good=False):
-        self.ids.status.color = theme.rgba(theme.TEAL_DARK if good else theme.DANGER)
+        self.ids.status.color = theme.rgba(theme.GREEN_DARK if good else theme.DANGER)
         self.ids.status.text = text
 
     def save_draft(self):
@@ -1139,7 +1402,7 @@ class CreateDayScreen(PodScreen):
                 strict=self.admin_editing
             )
             self.event_id = app.db.save_event(
-                date_str, location, items, team_ids, app.current_user_id,
+                date_str, location, items, team_ids, app.view_user_id,
                 crew_names=crew_names,
                 allow_locked=self.admin_editing,
                 editor_id=app.current_user_id,
@@ -1180,7 +1443,7 @@ class CreateDayScreen(PodScreen):
         try:
             date_str, location, items, team_ids, crew_names, _ = self._collect(strict=True)
             event_id = app.db.save_event(
-                date_str, location, items, team_ids, app.current_user_id,
+                date_str, location, items, team_ids, app.view_user_id,
                 crew_names=crew_names, cups_target=self._target(),
             )
             app.db.submit_event(event_id, app.current_user_id)
@@ -1231,7 +1494,7 @@ class CreateDayScreen(PodScreen):
             self._say(str(err))
             return
 
-        event = app.db.get_event(date_str)
+        event = app.db.get_event(date_str, app.view_user_id)
         if event is not None and event["submitted_at"]:
             who = app.db.get_user(event["submitted_by"])
             status_text = (
@@ -1289,6 +1552,10 @@ class PodInventoryApp(App):
     current_user_role_text = StringProperty("")
     current_user_initial = StringProperty("")
     current_user_photo = StringProperty("")
+    view_user_id = NumericProperty(0)               # whose days are on screen
+    view_banner = StringProperty("")                # "Viewing Mia's days" or ""
+    viewing_other = BooleanProperty(False)
+    events_label = StringProperty("TOTAL EVENTS")
     total_events = NumericProperty(0)
     next_duty_text = StringProperty("")
     target_date = StringProperty("")
@@ -1309,6 +1576,7 @@ class PodInventoryApp(App):
         self.title = "The Pod Inventory"
         self._ensure_kv()
         manager = ScreenManager(transition=SlideTransition(duration=0.18))
+        Window.bind(on_keyboard=self._on_key)
         self.loading = LoadingScreen(name="loading")
         manager.add_widget(self.loading)          # the first screen: the filling cup
         self._boot_steps = [
@@ -1324,6 +1592,68 @@ class PodInventoryApp(App):
         self._boot_progress = 0.0
         Clock.schedule_once(self._boot_tick, 0.3)
         return manager
+
+    # ------------------------------------------------------------- phone Back button
+    BACK_TARGET = {"create_account": "choose", "account": "home", "calendar": "home", "create_day": "home"}
+
+    def _on_key(self, window, key, *args):
+        """The phone's Back button (key 27). Close the top box, or go one screen back.
+        On the sign-in and home screens it asks to press twice, so a slip never exits."""
+        if key != 27:
+            return False
+        # 1. the top-most open box (sheet, popup, spinner list)
+        for child in reversed(window.children):
+            if isinstance(child, ModalView) and getattr(child, "_is_open", False):
+                sheet = getattr(child, "sheet", None)
+                if sheet is not None:
+                    sheet.dispatch("on_back")
+                else:
+                    child.dismiss()
+                return True
+        current = self.root.current if self.root else ""
+        if current == "loading":
+            return True
+        # 2. a normal screen goes back to where its "<" arrow goes
+        if current in self.BACK_TARGET:
+            self.go(self.BACK_TARGET[current], "right")
+            return True
+        # 3. home and sign-in: press twice
+        now = Clock.get_time()
+        if now - getattr(self, "_last_back", -10) < 2.0:
+            if current == "home":
+                self.logout()
+                return True
+            self.stop()
+            return True
+        self._last_back = now
+        self.show_hint("Press back again to sign out" if current == "home" else "Press back again to exit")
+        return True
+
+    def show_hint(self, text):
+        """A small message at the bottom of the screen for two seconds."""
+        old = getattr(self, "_hint", None)
+        if old is not None and old.parent is not None:
+            old.parent.remove_widget(old)
+        hint = Label(
+            text=text, size_hint=(None, None), size=(dp(260), dp(40)),
+            pos=((Window.width - dp(260)) / 2, dp(90)), color=(1, 1, 1, 1),
+        )
+        with hint.canvas.before:
+            from kivy.graphics import Color, RoundedRectangle
+            Color(0.23, 0.11, 0.05, 0.92)
+            RoundedRectangle(pos=hint.pos, size=hint.size, radius=[dp(20)])
+        Window.add_widget(hint)
+        self._hint = hint
+        Clock.schedule_once(
+            lambda dt: hint.parent.remove_widget(hint) if hint.parent else None, 2.0
+        )
+
+    def on_pause(self):
+        """Stay alive while the person visits Android settings (for file access)."""
+        return True
+
+    def on_resume(self):
+        pass
 
     def _boot_database(self):
         self.db = Database(os.path.join(self.user_data_dir, "pod_inventory.db"))
@@ -1353,13 +1683,37 @@ class PodInventoryApp(App):
         self.root.current = screen_name
 
     def refresh_totals(self):
-        self.total_events = self.db.count_events()
-        upcoming = self.db.next_booking(date.today().isoformat())
+        self.total_events = self.db.count_events(self.view_user_id)
+        upcoming = self.db.next_booking(date.today().isoformat(), self.view_user_id)
         if upcoming:
             nice = datetime.strptime(upcoming, "%Y-%m-%d").strftime("%a, %b %d")
             self.next_duty_text = f"Next pending work day: {nice}"
         else:
             self.next_duty_text = "No pending work days booked"
+
+    def set_view(self, user_id, go_home=True):
+        """Choose whose days are shown. Only the Creator admin may look at another
+        account; everybody else always sees their own days."""
+        if user_id != self.current_user_id and self.current_user_role != ADMIN:
+            user_id = self.current_user_id
+        user = self.db.get_user(user_id)
+        if user is None or user["deleted_at"] is not None and user_id != self.current_user_id:
+            user_id = self.current_user_id
+            user = self.db.get_user(user_id)
+        self.view_user_id = user_id
+        self.viewing_other = user_id != self.current_user_id
+        if self.viewing_other:
+            self.view_banner = f"Viewing {user['name']}"
+            self.events_label = f"{user['name'].upper()}'S EVENTS"
+        else:
+            self.view_banner = ""
+            self.events_label = "TOTAL EVENTS"
+        self.refresh_totals()
+        if go_home:
+            try:
+                self.root.get_screen("home").refresh_accounts()
+            except Exception:
+                pass
 
     def try_login(self, user_id):
         """Open a profile. Profiles with a PIN ask for it first."""
@@ -1391,7 +1745,7 @@ class PodInventoryApp(App):
         self.current_user_role_text = role_label(user["role"])
         self.current_user_initial = user["name"][:1].upper()
         self.current_user_photo = photo_of(user)
-        self.refresh_totals()
+        self.set_view(user["id"], go_home=False)
         self.go("home")
 
     def logout(self):
@@ -1400,6 +1754,10 @@ class PodInventoryApp(App):
         self.current_user_role = CREW
         self.current_user_role_text = ""
         self.current_user_photo = ""
+        self.view_user_id = 0
+        self.view_banner = ""
+        self.viewing_other = False
+        self.events_label = "TOTAL EVENTS"
         self.go("choose", "right")
 
 

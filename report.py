@@ -13,12 +13,12 @@ WIDTH = 1240          # about A4 width at 150 dpi
 MARGIN = 80
 MIN_HEIGHT = 1754     # about A4 height at 150 dpi
 
-TEAL = (15, 118, 110)
-TEAL_SOFT = (215, 237, 233)
-INK = (31, 36, 48)
-MUTED = (91, 98, 112)
-LINE = (213, 207, 196)
-ROW_ALT = (246, 243, 238)
+TEAL = (138, 75, 26)
+TEAL_SOFT = (243, 221, 176)
+INK = (59, 29, 12)
+MUTED = (122, 90, 58)
+LINE = (217, 190, 138)
+ROW_ALT = (252, 244, 224)
 DANGER = (180, 35, 24)
 ALERT = (230, 0, 0)
 ALERT_SOFT = (255, 225, 225)
@@ -61,7 +61,7 @@ def _draw(draw, data, fonts):
 
     # header band
     draw.rectangle([0, 0, WIDTH, 170], fill=TEAL)
-    draw.text((MARGIN, 38), "THE POD", font=small, fill=(210, 236, 232))
+    draw.text((MARGIN, 38), "THE POD", font=small, fill=(243, 221, 176))
     draw.text((MARGIN, 76), data["title"], font=title, fill=WHITE)
 
     y = 215

@@ -95,13 +95,14 @@ class Database:
 
                 CREATE TABLE IF NOT EXISTS events (
                     id            INTEGER PRIMARY KEY AUTOINCREMENT,
-                    event_date    TEXT NOT NULL UNIQUE,   -- YYYY-MM-DD
+                    event_date    TEXT NOT NULL,          -- YYYY-MM-DD
                     location      TEXT NOT NULL,
                     created_by    INTEGER REFERENCES users(id),
                     created_at    TEXT NOT NULL,
                     submitted_by  INTEGER REFERENCES users(id),
                     submitted_at  TEXT,                   -- NULL = still a draft
-                    cups_target   REAL                    -- cups the day's contract says to serve
+                    cups_target   REAL,                   -- cups the day's contract says to serve
+                    UNIQUE (event_date, created_by)       -- one record per account per date
                 );
 
                 CREATE TABLE IF NOT EXISTS event_team (
@@ -137,9 +138,10 @@ class Database:
 
                 -- pending work days booked in advance (not started yet)
                 CREATE TABLE IF NOT EXISTS bookings (
-                    work_date   TEXT PRIMARY KEY,         -- YYYY-MM-DD
-                    created_by  INTEGER REFERENCES users(id),
-                    created_at  TEXT NOT NULL
+                    work_date   TEXT NOT NULL,            -- YYYY-MM-DD
+                    created_by  INTEGER NOT NULL REFERENCES users(id),
+                    created_at  TEXT NOT NULL,
+                    PRIMARY KEY (work_date, created_by)
                 );
 
                 -- who did what to a day. event_id has no foreign key on purpose,
@@ -156,6 +158,7 @@ class Database:
                 """
             )
             self._upgrade_old_tables(conn)
+        self._make_data_per_account()
 
     @staticmethod
     def _upgrade_old_tables(conn):
@@ -192,6 +195,78 @@ class Database:
             fixed = normalize_role(row["role"])
             if fixed != row["role"]:
                 conn.execute("UPDATE users SET role = ? WHERE id = ?", (fixed, row["id"]))
+
+    def _make_data_per_account(self):
+        """Versions before 2.1 allowed one record per date for the whole phone.
+        Now every account has its own days, so the same date can exist once per
+        account. SQLite cannot change a constraint in place, so the tables are
+        rebuilt (all rows are kept)."""
+        with closing(sqlite3.connect(self.path)) as conn:
+            conn.row_factory = sqlite3.Row
+            old_events = False
+            for idx in conn.execute("PRAGMA index_list(events)").fetchall():
+                if idx["unique"]:
+                    cols = [r["name"] for r in conn.execute(f"PRAGMA index_info('{idx['name']}')")]
+                    if cols == ["event_date"]:
+                        old_events = True
+            booking_pk = {
+                r["name"]: r["pk"] for r in conn.execute("PRAGMA table_info(bookings)")
+            }
+            old_bookings = booking_pk.get("created_by", 0) == 0
+            if not (old_events or old_bookings):
+                return
+            conn.execute("PRAGMA foreign_keys = OFF")
+            admin_row = conn.execute(
+                "SELECT id FROM users WHERE role = ? ORDER BY id LIMIT 1", (ADMIN,)
+            ).fetchone()
+            first = admin_row[0] if admin_row else (
+                conn.execute("SELECT MIN(id) FROM users").fetchone()[0] or 0
+            )
+            if old_events:
+                conn.executescript(
+                    f"""
+                    BEGIN;
+                    CREATE TABLE events_new (
+                        id            INTEGER PRIMARY KEY AUTOINCREMENT,
+                        event_date    TEXT NOT NULL,
+                        location      TEXT NOT NULL,
+                        created_by    INTEGER REFERENCES users(id),
+                        created_at    TEXT NOT NULL,
+                        submitted_by  INTEGER REFERENCES users(id),
+                        submitted_at  TEXT,
+                        cups_target   REAL,
+                        UNIQUE (event_date, created_by)
+                    );
+                    INSERT INTO events_new
+                        (id, event_date, location, created_by, created_at,
+                         submitted_by, submitted_at, cups_target)
+                        SELECT id, event_date, location,
+                               COALESCE(created_by, {first or 'NULL'}), created_at,
+                               submitted_by, submitted_at, cups_target FROM events;
+                    DROP TABLE events;
+                    ALTER TABLE events_new RENAME TO events;
+                    COMMIT;
+                    """
+                )
+            if old_bookings:
+                # a booking whose creator is unknown is given to the admin (or first account)
+                conn.executescript(
+                    f"""
+                    BEGIN;
+                    CREATE TABLE bookings_new (
+                        work_date   TEXT NOT NULL,
+                        created_by  INTEGER NOT NULL REFERENCES users(id),
+                        created_at  TEXT NOT NULL,
+                        PRIMARY KEY (work_date, created_by)
+                    );
+                    INSERT INTO bookings_new (work_date, created_by, created_at)
+                        SELECT work_date, COALESCE(created_by, {int(first)}), created_at
+                        FROM bookings;
+                    DROP TABLE bookings;
+                    ALTER TABLE bookings_new RENAME TO bookings;
+                    COMMIT;
+                    """
+                )
 
     @staticmethod
     def _log(conn, event_id, event_date, user_id, action, detail=""):
@@ -294,14 +369,26 @@ class Database:
             )
 
     # ----------------------------------------------------------------- events
-    def count_events(self):
+    def count_events(self, owner_id=None):
+        """Days of one account (owner_id), or of everybody when owner_id is None."""
         with closing(self._connect()) as conn:
-            return conn.execute("SELECT COUNT(*) FROM events").fetchone()[0]
-
-    def get_event(self, event_date):
-        with closing(self._connect()) as conn:
+            if owner_id is None:
+                return conn.execute("SELECT COUNT(*) FROM events").fetchone()[0]
             return conn.execute(
-                "SELECT * FROM events WHERE event_date = ?", (event_date,)
+                "SELECT COUNT(*) FROM events WHERE created_by = ?", (owner_id,)
+            ).fetchone()[0]
+
+    def get_event(self, event_date, owner_id=None):
+        """The day this account recorded on that date (owner_id None = first found)."""
+        with closing(self._connect()) as conn:
+            if owner_id is None:
+                return conn.execute(
+                    "SELECT * FROM events WHERE event_date = ? ORDER BY id LIMIT 1",
+                    (event_date,),
+                ).fetchone()
+            return conn.execute(
+                "SELECT * FROM events WHERE event_date = ? AND created_by = ?",
+                (event_date, owner_id),
             ).fetchone()
 
     @staticmethod
@@ -372,8 +459,8 @@ class Database:
         with closing(self._connect()) as conn, conn:
             row = conn.execute(
                 "SELECT id, location, submitted_at, cups_target FROM events "
-                "WHERE event_date = ?",
-                (event_date,),
+                "WHERE event_date = ? AND created_by = ?",
+                (event_date, created_by),
             ).fetchone()
             locked = row is not None and row["submitted_at"] is not None
             if locked and not allow_locked:
@@ -455,7 +542,10 @@ class Database:
                 )
 
             # the day has started, so it is no longer just a booking
-            conn.execute("DELETE FROM bookings WHERE work_date = ?", (event_date,))
+            conn.execute(
+                "DELETE FROM bookings WHERE work_date = ? AND created_by = ?",
+                (event_date, created_by),
+            )
             return event_id
 
     def submit_event(self, event_id, user_id):
@@ -501,14 +591,16 @@ class Database:
             ).fetchall()
         return [dict(r) for r in rows]
 
-    def month_status(self, year, month):
-        """Return {'2026-11-08': 'submitted' or 'draft'} for one month."""
+    def month_status(self, year, month, owner_id=None):
+        """Return {'2026-11-08': 'submitted' or 'draft'} for one month of one account."""
         prefix = f"{year:04d}-{month:02d}-"
+        sql = "SELECT event_date, submitted_at FROM events WHERE event_date LIKE ?"
+        args = [prefix + "%"]
+        if owner_id is not None:
+            sql += " AND created_by = ?"
+            args.append(owner_id)
         with closing(self._connect()) as conn:
-            rows = conn.execute(
-                "SELECT event_date, submitted_at FROM events WHERE event_date LIKE ?",
-                (prefix + "%",),
-            ).fetchall()
+            rows = conn.execute(sql, args).fetchall()
         return {
             r["event_date"]: ("submitted" if r["submitted_at"] else "draft") for r in rows
         }
@@ -516,7 +608,7 @@ class Database:
     # --------------------------------------------------------------- bookings
     def add_booking(self, work_date, user_id):
         """Mark a date as a pending work day."""
-        if self.get_event(work_date) is not None:
+        if self.get_event(work_date, user_id) is not None:
             raise ValueError("That day already has a record.")
         with closing(self._connect()) as conn, conn:
             conn.execute(
@@ -525,31 +617,41 @@ class Database:
                 (work_date, user_id, _now()),
             )
 
-    def remove_booking(self, work_date):
+    def remove_booking(self, work_date, owner_id=None):
+        sql, args = "DELETE FROM bookings WHERE work_date = ?", [work_date]
+        if owner_id is not None:
+            sql += " AND created_by = ?"
+            args.append(owner_id)
         with closing(self._connect()) as conn, conn:
-            conn.execute("DELETE FROM bookings WHERE work_date = ?", (work_date,))
+            conn.execute(sql, args)
 
-    def has_booking(self, work_date):
+    def has_booking(self, work_date, owner_id=None):
+        sql, args = "SELECT 1 FROM bookings WHERE work_date = ?", [work_date]
+        if owner_id is not None:
+            sql += " AND created_by = ?"
+            args.append(owner_id)
         with closing(self._connect()) as conn:
-            row = conn.execute(
-                "SELECT 1 FROM bookings WHERE work_date = ?", (work_date,)
-            ).fetchone()
+            row = conn.execute(sql, args).fetchone()
         return row is not None
 
-    def month_bookings(self, year, month):
+    def month_bookings(self, year, month, owner_id=None):
         prefix = f"{year:04d}-{month:02d}-"
+        sql, args = "SELECT work_date FROM bookings WHERE work_date LIKE ?", [prefix + "%"]
+        if owner_id is not None:
+            sql += " AND created_by = ?"
+            args.append(owner_id)
         with closing(self._connect()) as conn:
-            rows = conn.execute(
-                "SELECT work_date FROM bookings WHERE work_date LIKE ?", (prefix + "%",)
-            ).fetchall()
+            rows = conn.execute(sql, args).fetchall()
         return {r["work_date"] for r in rows}
 
-    def next_booking(self, from_date):
+    def next_booking(self, from_date, owner_id=None):
         """The soonest pending work day on or after from_date, or None."""
+        sql, args = "SELECT MIN(work_date) AS d FROM bookings WHERE work_date >= ?", [from_date]
+        if owner_id is not None:
+            sql += " AND created_by = ?"
+            args.append(owner_id)
         with closing(self._connect()) as conn:
-            row = conn.execute(
-                "SELECT MIN(work_date) AS d FROM bookings WHERE work_date >= ?", (from_date,)
-            ).fetchone()
+            row = conn.execute(sql, args).fetchone()
         return row["d"]
 
     # ----------------------------------------------------------------- photos
